@@ -63,6 +63,7 @@ def make_param(map_name: str, randomize: bool = True, model: str = "st", **overr
         # dynamics
         model=model,
         integrator="rk4",
+        controller="classic",  # matches the ROS sim (decision D3)
         timestep=cp.TIMESTEP,
         timestep_ratio=cp.TIMESTEP_RATIO,
         longitudinal_action_type="velocity",

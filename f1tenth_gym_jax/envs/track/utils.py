@@ -100,7 +100,8 @@ def find_track_dir(track_name: str) -> pathlib.Path:
     tracks_r.raise_for_status()
 
     print("Extracting Files for: " + track_name)
-    with tarfile.open(fileobj=io.BytesIO(tracks_r.content), mode="r:xz") as tracks_file:
+    # The server has served both xz and gzip archives under the .tar.xz name.
+    with tarfile.open(fileobj=io.BytesIO(tracks_r.content), mode="r:*") as tracks_file:
         _safe_extractall(tracks_file, map_dir)
 
     track_dir = _find_existing_track_dir(track_name, (map_dir,))

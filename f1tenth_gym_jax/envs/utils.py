@@ -9,6 +9,9 @@ from flax import struct
 from .multi_agent_env import MultiAgentEnv
 
 VALID_REWARDS = frozenset({"time", "progress", "alive"})
+VALID_CONTROLLERS = frozenset({"direct", "classic"})
+# physics steps a steering command waits in f1tenth_gym's RaceCar.steer_buffer
+CLASSIC_STEER_BUFFER_SIZE = 2
 
 # Vehicle parameters that may differ per environment / agent. They are traced
 # through the dynamics instead of being compiled in via the static ``Param``.
@@ -81,6 +84,10 @@ class State:
     # per-agent vehicle parameters, each field [n_agent, ]; None -> use Param
     dyn_params: Optional[DynParams] = None
 
+    # steering commands waiting in the "classic" controller's delay buffer,
+    # newest first, [n_agent, CLASSIC_STEER_BUFFER_SIZE]; None otherwise
+    steer_buffer: Optional[chex.Array] = None
+
 
 @struct.dataclass
 class LogEnvState:
@@ -122,6 +129,12 @@ class Param:
         "steeringvelocity"  # ["steeringangle", "steeringvelocity"]
     )
     integrator: str = "rk4"  # dynamics integrator
+    # How velocity+steeringangle commands become acceleration and steering
+    # velocity. "direct": (target - current) / timestep inside the dynamics,
+    # saturated by the limits. "classic": as the classic f1tenth_gym (v0.2.x,
+    # used by f1tenth_gym_ros) - a 2-physics-step steering buffer, then its
+    # bang-bang steering / P speed controller, held over each physics step.
+    controller: str = "direct"
     model: str = "st"  # dynamics model type
     produce_scans: bool = False  # whether to turn on laser scan
     collision_on: bool = True  # whether to turn on collision detection

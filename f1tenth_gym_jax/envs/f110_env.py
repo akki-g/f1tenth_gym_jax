@@ -23,6 +23,8 @@ from .collision_models import collision, collision_map, get_vertices
 
 # dynamics
 from .dynamic_models import (
+    pid_accl,
+    pid_steer,
     vehicle_dynamics_ks,
     vehicle_dynamics_st_smooth,
     vehicle_dynamics_st_switching,
@@ -40,7 +42,14 @@ from .spaces import Box
 from .track import Track
 
 # dataclasses
-from .utils import VALID_REWARDS, DynParams, Param, State
+from .utils import (
+    CLASSIC_STEER_BUFFER_SIZE,
+    VALID_CONTROLLERS,
+    VALID_REWARDS,
+    DynParams,
+    Param,
+    State,
+)
 
 
 def _validate_positive_int(name: str, value: int) -> None:
@@ -170,6 +179,26 @@ class F110Env(MultiAgentEnv):
                 "Choose either 'acceleration' or 'velocity'."
             )
 
+        if params.controller not in VALID_CONTROLLERS:
+            raise ValueError(
+                f"Chosen controller {params.controller} is invalid. "
+                f"Choose from {sorted(VALID_CONTROLLERS)}."
+            )
+        if params.controller == "classic":
+            if (params.longitudinal_action_type, params.steering_action_type) != (
+                "velocity",
+                "steeringangle",
+            ):
+                raise ValueError(
+                    "The classic controller needs velocity+steeringangle control."
+                )
+            # one physics step driven by the controller's (sv, accl) output
+            self._physics_params = params.replace(
+                timestep_ratio=1,
+                longitudinal_action_type="acceleration",
+                steering_action_type="steeringvelocity",
+            )
+
         action_low = jnp.array([steering_bounds[0], longitudinal_bounds[0]])
         action_high = jnp.array([steering_bounds[1], longitudinal_bounds[1]])
         self.action_spaces = {
@@ -279,23 +308,34 @@ class F110Env(MultiAgentEnv):
         us = jnp.array([actions[i] for i in self.agents])
         # stop collided cars
         us = jnp.where(state.collisions[:, None], jnp.zeros_like(us), us)
-        x_and_u = jnp.hstack((x, us))
-        # integrate dynamics, vmapped over agents (and their vehicle params)
-        if state.dyn_params is None:
-            integrator = jax.vmap(self.integrator_func, in_axes=[None, 0, None])
-            new_x_and_u = integrator(self.model_func, x_and_u, self.params)
-        else:
-            integrator = jax.vmap(self.integrator_func, in_axes=[None, 0, None, 0])
-            new_x_and_u = integrator(
-                self.model_func, x_and_u, self.params, state.dyn_params
+        if self.params.controller == "classic":
+            new_x, steer_buffer = self._integrate_classic(
+                x, us, state.steer_buffer, state.dyn_params
             )
-        final_x_and_u = jnp.where(state.collisions[:, None], x_and_u, new_x_and_u)
+            final_x = jnp.where(state.collisions[:, None], x, new_x)
+            state = state.replace(steer_buffer=steer_buffer)
+        else:
+            x_and_u = jnp.hstack((x, us))
+            # integrate dynamics, vmapped over agents (and their vehicle params)
+            if state.dyn_params is None:
+                integrator = jax.vmap(self.integrator_func, in_axes=[None, 0, None])
+                new_x_and_u = integrator(self.model_func, x_and_u, self.params)
+            else:
+                integrator = jax.vmap(
+                    self.integrator_func, in_axes=[None, 0, None, 0]
+                )
+                new_x_and_u = integrator(
+                    self.model_func, x_and_u, self.params, state.dyn_params
+                )
+            final_x = jnp.where(state.collisions[:, None], x_and_u, new_x_and_u)[
+                :, :-2
+            ]
         state = state.replace(
             last_cartesian_states=state.cartesian_states,
-            cartesian_states=final_x_and_u[:, :-2],
+            cartesian_states=final_x,
             last_frenet_states=state.frenet_states,
             frenet_states=self.track.vmap_cartesian_to_frenet_jax(
-                final_x_and_u[:, [0, 1, 4]]
+                final_x[:, [0, 1, 4]]
             ),
         )
         state = jax.lax.cond(
@@ -324,6 +364,31 @@ class F110Env(MultiAgentEnv):
         infos = {}
 
         return obs, state, rewards, dones, infos
+
+    def _integrate_classic(self, x, us, steer_buffer, dyn_params):
+        """timestep_ratio physics steps as in f1tenth_gym's RaceCar.update_pose.
+
+        Each step takes the oldest buffered steering command, pushes the new
+        one, converts (speed, steering angle) targets to (accl, sv) with the
+        classic P / bang-bang controller and integrates with them held fixed.
+        """
+        p = self._physics_params
+        if dyn_params is None:
+            integrate = jax.vmap(self.integrator_func, in_axes=[None, 0, None])
+            extra = ()
+        else:
+            integrate = jax.vmap(self.integrator_func, in_axes=[None, 0, None, 0])
+            extra = (dyn_params,)
+        steer_pid = jax.vmap(pid_steer, in_axes=[0, 0, None])
+        accl_pid = jax.vmap(pid_accl, in_axes=[0, 0, None, None, None])
+        for _ in range(self.params.timestep_ratio):
+            steer = steer_buffer[:, -1]
+            steer_buffer = jnp.concatenate((us[:, :1], steer_buffer[:, :-1]), axis=1)
+            sv = steer_pid(steer, x[:, 2], p.sv_max)
+            accl = accl_pid(us[:, 1], x[:, 3], p.a_max, p.v_max, p.v_min)
+            x_and_u = jnp.hstack((x, jnp.stack((sv, accl), axis=1)))
+            x = integrate(self.model_func, x_and_u, p, *extra)[:, :-2]
+        return x, steer_buffer
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], State]:
@@ -373,6 +438,11 @@ class F110Env(MultiAgentEnv):
             accumulated_angles=jnp.zeros((self.num_agents,)),
             last_accumulated_angles=jnp.zeros((self.num_agents,)),
             dyn_params=dyn_params,
+            steer_buffer=(
+                jnp.zeros((self.num_agents, CLASSIC_STEER_BUFFER_SIZE))
+                if self.params.controller == "classic"
+                else None
+            ),
         )
 
         # scan if needed

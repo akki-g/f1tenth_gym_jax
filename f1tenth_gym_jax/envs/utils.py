@@ -130,6 +130,8 @@ class Param:
     num_beams: int = 64  # number of beams in each scan, scan param
     eps: float = 0.01  # epsilon to stop ray marching, scan param
     max_range: float = 10.0  # max range of scan, scan param
+    scan_origin_offset: float = 0.0  # scan origin ahead of the state's x, y, m
+    scan_noise_std: float = 0.01  # std of Gaussian noise added to scans, m
     observe_others: bool = True  # whether can observe other agents
     map_name: str = "Spielberg"  # map for environment
     max_num_laps: int = 1  # maximum number of laps to run before done

@@ -101,6 +101,8 @@ class F110Env(MultiAgentEnv):
         _validate_positive_number("field of view", params.fov)
         _validate_positive_number("scan epsilon", params.eps)
         _validate_positive_number("max scan range", params.max_range)
+        if not isinstance(params.scan_noise_std, Real) or params.scan_noise_std < 0:
+            raise ValueError("scan noise std must be non-negative.")
         _validate_ordered_bounds("steering angle", params.s_min, params.s_max)
         _validate_ordered_bounds("steering velocity", params.sv_min, params.sv_max)
         _validate_ordered_bounds("velocity", params.v_min, params.v_max)
@@ -548,8 +550,14 @@ class F110Env(MultiAgentEnv):
                 in_axes=[0],
             )
         )
-        scans = get_scan_vmapped(state.cartesian_states[:, [0, 1, 4]])
-        noise = jax.random.normal(key, scans.shape) * 0.01
+        # Cast from the sensor, scan_origin_offset ahead of the state's
+        # reference point (the CG for "st"/"st_smooth", rear axle for "ks").
+        poses = state.cartesian_states[:, [0, 1, 4]]
+        offset = self.params.scan_origin_offset
+        poses = poses.at[:, 0].add(offset * jnp.cos(poses[:, 2]))
+        poses = poses.at[:, 1].add(offset * jnp.sin(poses[:, 2]))
+        scans = get_scan_vmapped(poses)
+        noise = jax.random.normal(key, scans.shape) * self.params.scan_noise_std
         new_state = state.replace(scans=scans + noise)
         return new_state
 

@@ -16,5 +16,6 @@ Public docstrings should use NumPy-style sections such as ``Parameters``,
    integrator
    dynamic_models
    collision_models
+   laser_models
    track
    rendering

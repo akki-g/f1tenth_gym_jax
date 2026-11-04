@@ -16,8 +16,6 @@ import jax.numpy as jnp
 # numpy scipy
 import numpy as np
 
-# scanning
-from jax_pf.ray_marching import get_scan
 from scipy.ndimage import distance_transform_edt as edt
 
 # collisions
@@ -32,6 +30,9 @@ from .dynamic_models import (
 
 # integrators
 from .integrator import integrate_euler, integrate_rk4
+
+# scanning
+from .laser_models import beam_offsets, get_scan_exact
 from .multi_agent_env import MultiAgentEnv
 from .spaces import Box
 
@@ -243,11 +244,9 @@ class F110Env(MultiAgentEnv):
         self.eps = self.params.eps
         self.max_range = self.params.max_range
 
-        angle_increment = self.fov / (self.num_beams - 1)
-        self.theta_index_increment = self.theta_dis * angle_increment / (2 * np.pi)
-        theta_arr = jnp.linspace(0.0, 2 * jnp.pi, num=self.theta_dis)
-        self.scan_sines = jnp.sin(theta_arr)
-        self.scan_cosines = jnp.cos(theta_arr)
+        # beam i at exactly -fov/2 + i * fov / (num_beams - 1) from the heading
+        # (theta_dis is no longer used: angles are not looked up in a table)
+        self.beam_offsets = beam_offsets(self.fov, self.num_beams)
 
         self.distance_transform = edt(self.track.occ_map) * self.track.resolution
         self.height, self.width = self.track.occ_map.shape
@@ -526,28 +525,20 @@ class F110Env(MultiAgentEnv):
 
     @partial(jax.jit, static_argnums=[0])
     def _scan(self, state: State, key: chex.PRNGKey) -> State:
-        get_scan_vmapped = jax.jit(
-            jax.vmap(
-                partial(
-                    get_scan,
-                    theta_dis=self.theta_dis,
-                    fov=self.fov,
-                    num_beams=self.num_beams,
-                    theta_index_increment=self.theta_index_increment,
-                    sines=self.scan_sines,
-                    cosines=self.scan_cosines,
-                    eps=self.eps,
-                    orig_x=self.orig_x,
-                    orig_y=self.orig_y,
-                    orig_c=self.orig_c,
-                    orig_s=self.orig_s,
-                    height=self.height,
-                    width=self.width,
-                    resolution=self.resolution,
-                    dt=self.distance_transform,
-                    max_range=self.max_range,
-                ),
-                in_axes=[0],
+        get_scan_vmapped = jax.vmap(
+            partial(
+                get_scan_exact,
+                offsets=self.beam_offsets,
+                eps=self.eps,
+                orig_x=self.orig_x,
+                orig_y=self.orig_y,
+                orig_c=self.orig_c,
+                orig_s=self.orig_s,
+                height=self.height,
+                width=self.width,
+                resolution=self.resolution,
+                dt=self.distance_transform,
+                max_range=self.max_range,
             )
         )
         # Cast from the sensor, scan_origin_offset ahead of the state's

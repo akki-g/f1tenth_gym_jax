@@ -1,0 +1,6 @@
+image: Duct1045.png
+resolution: 0.05
+origin: [-12.269791578153862, -9.004012716809996, 0.0]
+negate: 0
+occupied_thresh: 0.45
+free_thresh: 0.196

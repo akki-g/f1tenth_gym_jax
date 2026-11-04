@@ -1,0 +1,6 @@
+image: Duct1064.png
+resolution: 0.05
+origin: [-10.71794388266011, -7.85687778864731, 0.0]
+negate: 0
+occupied_thresh: 0.45
+free_thresh: 0.196

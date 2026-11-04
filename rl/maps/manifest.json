@@ -1,0 +1,258 @@
+{
+  "train_maps": [
+    "Austin",
+    "BrandsHatch",
+    "Budapest",
+    "Catalunya",
+    "Hockenheim",
+    "Montreal",
+    "Monza",
+    "Silverstone",
+    "Duct1002",
+    "Duct1003",
+    "Duct1008",
+    "Duct1015",
+    "Duct1039",
+    "Duct1045",
+    "Duct1064",
+    "Duct1070"
+  ],
+  "heldout_maps": [
+    "Spielberg",
+    "Oschersleben",
+    "MoscowRaceway",
+    "Duct1077",
+    "Duct1112",
+    "Duct1142"
+  ],
+  "train_gen_seeds": [
+    1002,
+    1003,
+    1008,
+    1015,
+    1039,
+    1045,
+    1064,
+    1070
+  ],
+  "heldout_gen_seeds": [
+    1077,
+    1112,
+    1142
+  ],
+  "generator": {
+    "resolution": 0.05,
+    "wall": 0.15,
+    "width": [
+      1.5,
+      2.5
+    ],
+    "length": [
+      40.0,
+      80.0
+    ],
+    "min_radius": 1.0,
+    "clearance": 0.3,
+    "rad_scale": 0.5
+  },
+  "map_dir": "/Users/akshatguduru/Desktop/CARVEL/f1tenth_gym_jax/rl/maps",
+  "maps": {
+    "Austin": {
+      "kind": "racetrack",
+      "files": {
+        "Austin.png": "16501f0cf2333305c305efb6cc3110c7a31e2843263067ddc52edfe826633318",
+        "Austin.yaml": "2520c406ce885fec026fe76d2b66f1c59db9f1260d4ed963db44e4f6b213d5bb",
+        "Austin_centerline.csv": "74b5f86d89ca0a276e6b158c923161a0e47ed88404729852b6c13ada05d5af04",
+        "Austin_raceline.csv": "f984fc20bc0a08eb584be75ef7dfad137a95747981f0f1dc0afcbf4332671779"
+      }
+    },
+    "BrandsHatch": {
+      "kind": "racetrack",
+      "files": {
+        "BrandsHatch.png": "e56c8cd34766ef38476ff3637dcec167ff275041f12a0cfc122e5f87aacd2eeb",
+        "BrandsHatch.yaml": "2b92588eb4af2b6c6916602fcf6a3fb23884377d2ebd5ecf0e69634e8260bab0",
+        "BrandsHatch_centerline.csv": "1d6246e6e6db1e065d22c19e102292c70dca71e34ded44968a1d5a4c2a8649c4",
+        "BrandsHatch_raceline.csv": "b1cf2cf858383d3a93ca45c80a8438fd289e3cb3a537483e67bdba6db2e32e8f"
+      }
+    },
+    "Budapest": {
+      "kind": "racetrack",
+      "files": {
+        "Budapest.png": "563d819bb68ee66236647f92ec68a2f7f60ecb90b92c9aab487be6f7840d04d6",
+        "Budapest.yaml": "e028ce57d014966b1d77c4f76a7f9578e7ecd276af1ba6d68c19f44ccddab6f8",
+        "Budapest_centerline.csv": "759ff3fa6096a9de5354a177582889425f16c529dc350d3ec3817f3c8b1d14ad",
+        "Budapest_raceline.csv": "a0b2774651b261c108c9793983203686f9a7623bea0fe25fa1987d38ea13b195"
+      }
+    },
+    "Catalunya": {
+      "kind": "racetrack",
+      "files": {
+        "Catalunya.png": "fe7087e601144ba869496859de1194a0f9eaddaed6b20db523186e51bd28e79c",
+        "Catalunya.yaml": "5df00f13873da44208c52f5b7897deb8f41fa07c0593faea13eda228bfeca4a3",
+        "Catalunya_centerline.csv": "f1276de8d59c63f0285cdb79d8626b4ccddad5e97bd69b9bf0b6b1cc13a98365",
+        "Catalunya_raceline.csv": "3dfca97d061702b712fefa114cb709ed1a10fbcb35b8ac19650bb3bef19e43c3"
+      }
+    },
+    "Hockenheim": {
+      "kind": "racetrack",
+      "files": {
+        "Hockenheim.png": "39a31a54cd59b1c1b983d2c5a57c9324d08148bb554034be335db8efed66c9fa",
+        "Hockenheim.yaml": "63bc4ed043e75395d390e00cb9c4cdbde4cbca7767d4ce97ffe99e5e463b3d8e",
+        "Hockenheim_centerline.csv": "47c888fe26a5ffa01758b613c57e5eaf8d165b3507c2e9b277b0715031cc9ce9",
+        "Hockenheim_raceline.csv": "a797ec0bec60fa913c18c8e4a1ec1391d4064d4519a03fe92c45849fc36fe561"
+      }
+    },
+    "Montreal": {
+      "kind": "racetrack",
+      "files": {
+        "Montreal.png": "22cf9b8b8a15fa7c20a0cdf1348957e763e89be12201fe17820c9bbdff889308",
+        "Montreal.yaml": "43e68fbc5261326d586c35e6dda27c09fa46ba376acd550f0fee295ef1554e55",
+        "Montreal_centerline.csv": "d24aa9a86c7ac93d140a067a19734d1e1cd4c3a6ec40264b5c28a3dda98d8608"
+      }
+    },
+    "Monza": {
+      "kind": "racetrack",
+      "files": {
+        "Monza.png": "a550c761e4f360703b374c714ee20920281fe25078862f52ae21b4570d47b2cf",
+        "Monza.yaml": "4815eb6863a9e486609535a0ac87a25483e3518d3d5f06d01f16eeb0fdad8253",
+        "Monza_centerline.csv": "198ea1f4d574477415c9f2065352574b34b120949c6ba9889fc26426312d31bf",
+        "Monza_raceline.csv": "0a28fa43852a914922e10082b1a49103d932c1ea501b594e74a509b4d1992bfa"
+      }
+    },
+    "Silverstone": {
+      "kind": "racetrack",
+      "files": {
+        "Silverstone.png": "074bfe8080ab70b18068c77ab19179f8c289305b1964888ad72a503d4c7baf4a",
+        "Silverstone.yaml": "3b28b387aba6d77c43279a5004a2d1c4a78ea9a64fe26c10cb34f9616936bc6e",
+        "Silverstone_centerline.csv": "c32b892aadee729368c56ece2064471be09d7b42f464491e2f28675d24d3150a",
+        "Silverstone_raceline.csv": "cc2925c22468c3cb57b225dc88eab933589c037805af4de6823fff340a64fd97"
+      }
+    },
+    "Duct1002": {
+      "kind": "generated",
+      "seed": 1002,
+      "files": {
+        "Duct1002.png": "24de5d5de7c2562a61a367e9201af2ccfed6d807f2f319c1c2eb5ec33fdab020",
+        "Duct1002.yaml": "d85885520c8adb5399ab28b9a6b3ee896545c357f653011c14daa20268feee58",
+        "Duct1002_centerline.csv": "0dc7e9bd801f2dd18fc3f8185d1e368a666f86e346bdb37bb30b8d8cf4d6c99d"
+      }
+    },
+    "Duct1003": {
+      "kind": "generated",
+      "seed": 1003,
+      "files": {
+        "Duct1003.png": "23fc6e2837635ba899f4ccc1007db9f0eddf9cb9f2b977d6dd58a2736c61a417",
+        "Duct1003.yaml": "99b2bc2239acf592ca199831ebfba173cb1e9364ec520cac3d20f270c4053276",
+        "Duct1003_centerline.csv": "8163a8288d35af3a48d1eceb6a3811090a79c5e9cb953f856aa9598f95747fcb"
+      }
+    },
+    "Duct1008": {
+      "kind": "generated",
+      "seed": 1008,
+      "files": {
+        "Duct1008.png": "14058e16453a2a46c7a320d27ef6b4cf990517ef59576205428697413c643eb1",
+        "Duct1008.yaml": "53d9d0d04ab43c6189379be05afb3f047d16290b6bce4a039594a6f5d15579c4",
+        "Duct1008_centerline.csv": "15dcbfa66c692ce3eff566371e8427e511097c82152a7cb184b430b535bcd28e"
+      }
+    },
+    "Duct1015": {
+      "kind": "generated",
+      "seed": 1015,
+      "files": {
+        "Duct1015.png": "9eed5f1590f7e82103a4af8864d31796b0bb6feb063792ff15825029682848a6",
+        "Duct1015.yaml": "283dca932649744ec7c782e382b206f9d5582ba70ea53d6622bf8085ff75b9dc",
+        "Duct1015_centerline.csv": "2155c40d8cc73182df6c6cc61c2d8d5e69f5ec4987183852c36704361e488f29"
+      }
+    },
+    "Duct1039": {
+      "kind": "generated",
+      "seed": 1039,
+      "files": {
+        "Duct1039.png": "b133526956236a64fa94b5824ffad5102c6f25a5b8ac3f1701cba11be8aa0ce9",
+        "Duct1039.yaml": "0be204d5f61c7fb2e7fab4df6a95fef8ec4de50dc959a2db8226bd815b672345",
+        "Duct1039_centerline.csv": "e470b6168fcc6361c29faadc3c086696c6b71d2ef75e14d7df2079fb37730cf6"
+      }
+    },
+    "Duct1045": {
+      "kind": "generated",
+      "seed": 1045,
+      "files": {
+        "Duct1045.png": "ed4ed44a5205353b829781d1c1553944e8f7d1f2a5f66c73c20cce39b19d03ce",
+        "Duct1045.yaml": "40225ce4a763015bd4ff28aeed65e5c16cf67ed89aa7bc51561811cb151bd59e",
+        "Duct1045_centerline.csv": "d38e5b3e7ae4d7fe3dcf078d41ab6f49e0ff3e5680a667de0ab2d21ed7285e60"
+      }
+    },
+    "Duct1064": {
+      "kind": "generated",
+      "seed": 1064,
+      "files": {
+        "Duct1064.png": "7e7487804d8a29bedec5c975f485baf40a11598cfd6139a54f8347599f51f1e3",
+        "Duct1064.yaml": "3c8fa325dac8ea4f41ab34b656bb2661d944145824576f36b9918f81adaa7fa4",
+        "Duct1064_centerline.csv": "88b0867211498e72d6be1530ca7889b525610e6dd41871c29f5c558d55f51163"
+      }
+    },
+    "Duct1070": {
+      "kind": "generated",
+      "seed": 1070,
+      "files": {
+        "Duct1070.png": "570122183dd0ad44ffee752ae322606b218c1c1dbb3df086866d0835d47e92d7",
+        "Duct1070.yaml": "c079b79aacdeecb639c2c61d7286583a31905a90312403f10c80c5027bb1ad2b",
+        "Duct1070_centerline.csv": "13dc9cfc94a5a212eb7be8f3db625e936af5b5cc5faeffa8dd80c7385b9cf824"
+      }
+    },
+    "Spielberg": {
+      "kind": "racetrack",
+      "files": {
+        "Spielberg.png": "3378ea1da231e00b4c41015311f7f3a63fb62420d8c54aaa23b6d1ca7c947e56",
+        "Spielberg.yaml": "43fa0026ecb663ce8a68f6d8959f01303bbcda122379070edcbd9f332747e6de",
+        "Spielberg_centerline.csv": "3c690173dda7772bffc36190e6d6f0e11e61be86a65e3910cd78cdd0c098c602",
+        "Spielberg_raceline.csv": "4b79179d42e712c9121ffbfb045cd0b06689d96607ffa5701324360450d1f0bd"
+      }
+    },
+    "Oschersleben": {
+      "kind": "racetrack",
+      "files": {
+        "Oschersleben.png": "3753d0ec3e0cb13602d4c34b172b877a1ba12eb6b4117dfd56da5d1b51ce4634",
+        "Oschersleben.yaml": "610dd677a6686441868b164d7468f4d50ed36d7be4070f9292fb98076fe76456",
+        "Oschersleben_centerline.csv": "6d906ee0fde07fd3f80ef4339abe289b596385aa7ff6f5318836b0b9c4012d44",
+        "Oschersleben_raceline.csv": "713e4d0f129172b058680afe604b29aed7b81d544abfbca18c942672a2ae62dd"
+      }
+    },
+    "MoscowRaceway": {
+      "kind": "racetrack",
+      "files": {
+        "MoscowRaceway.png": "af4c9818717b9f4066acd971fc65311c2794bc12f0fa5e1b742904e9bd634381",
+        "MoscowRaceway.yaml": "38190a613cffdd0aaca23c90b57e5e82c0879130ee177229f51e7eabb254a104",
+        "MoscowRaceway_centerline.csv": "d4db7d3419f17b86564ad447790be8d356f6c6f10235dd5abdc51bf990d959cd",
+        "MoscowRaceway_raceline.csv": "0dcbffc5677f42dcdc63ce6e1d8645aa4dca9d535e15da85c594b8d7b027f53a"
+      }
+    },
+    "Duct1077": {
+      "kind": "generated",
+      "seed": 1077,
+      "files": {
+        "Duct1077.png": "749f8eea94d749921b73e5bee2ed521f34bbc4663732427c712af8b0769fcc1c",
+        "Duct1077.yaml": "f3299573815f41c590811fd12eeacccf02156ed6a87738edee243bb2ea54e817",
+        "Duct1077_centerline.csv": "afa7f804627c09c2f44a9c1c47ab7ae44b84ae40f8ef0d4a7ba4fb62d175c366"
+      }
+    },
+    "Duct1112": {
+      "kind": "generated",
+      "seed": 1112,
+      "files": {
+        "Duct1112.png": "fad9c742fa32b35aae2e3f8154cf4f9cec23d072b27b68d0ffed57a06eecc69b",
+        "Duct1112.yaml": "ce74237060412ad2b7fc31dc32f25624922d62df13e7f4f7f41781d9cf998620",
+        "Duct1112_centerline.csv": "ad9ded380ca7feae8b8d8f9843800fe5e3e001b274833088a85dd4bbd1c5d23a"
+      }
+    },
+    "Duct1142": {
+      "kind": "generated",
+      "seed": 1142,
+      "files": {
+        "Duct1142.png": "966c4aa7e01fc5e3763ca5fa9e9f6b37258691f549e9b3b90c3ea7fe034f8ded",
+        "Duct1142.yaml": "217d96f4ed225c3cf020eeae250b12275bcd83c1029a3ae0467dbca2c2cf9cc4",
+        "Duct1142_centerline.csv": "ea5bbedf778339d03f16fb3437767bc3049b59cbf36d165ac774a27480a87471"
+      }
+    }
+  }
+}

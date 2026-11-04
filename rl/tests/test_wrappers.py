@@ -173,3 +173,16 @@ def test_eval_mode_is_deterministic():
     np.testing.assert_array_equal(np.asarray(o2), np.asarray(o3))  # no sensor noise
     with pytest.raises(ValueError):
         Phase1Wrapper(F110Env(1, make_param("Spielberg", randomize=False)), randomize=True)
+
+
+def test_laps_counted_from_progress(train_env):
+    """The episode ends once accumulated centerline progress reaches max_laps."""
+    _, ws = train_env.reset(jax.random.PRNGKey(12))
+    moving = ws.env_state.cartesian_states.at[0, 3].set(3.0)  # 3 m/s: ~0.12 m per step
+    ws = ws.replace(env_state=ws.env_state.replace(cartesian_states=moving),
+                    ep_progress=jnp.array(train_env.max_laps - 1e-4, jnp.float32), delay_k=jnp.array(0))
+    _, ws2, _, done, info = train_env.step(jax.random.PRNGKey(13), ws, jnp.array([-0.3, 0.0]))
+    assert bool(done) and bool(info["lap_complete"]) and not bool(info["collision"])
+    _, ws3, _, done, info = train_env.step(jax.random.PRNGKey(13), ws.replace(ep_progress=jnp.array(0.5, jnp.float32)), jnp.array([-0.3, 0.0]))
+    assert not bool(done) and not bool(info["lap_complete"])
+    assert train_env.env.params.max_num_laps > 1000  # env's winding counter is off

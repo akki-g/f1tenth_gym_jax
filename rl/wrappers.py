@@ -10,6 +10,12 @@ Stages, innermost first, as the spec orders them:
 5. Obs and reward    obs.py (shared with the car) and
                      r = 10 * dprogress/lap - 0.01 * |a_t - a_{t-1}|_1 - 1[collision]
 
+Laps are counted from accumulated centerline progress (``max_laps``, 2 for
+training) and end the episode here. The env's own winding-number lap
+counter is switched off (make_param sets a huge max_num_laps): on tracks
+that are not star-shaped around its winding point it reports a lap after as
+little as half a lap, depending on the start (results note, D9).
+
 The policy acts in a = (a_v, a_s) in [-1, 1]. The previous action in the
 observation is the policy's (clipped) action as sent on, before delay and
 steering offset: the car's node only knows what it published, not what the
@@ -84,7 +90,7 @@ def step_reward(progress_m, track_length, action, prev_action, collided):
 class Phase1Wrapper:
     """Single-agent, array-in/array-out wrapper; auto-resets on done."""
 
-    def __init__(self, env: F110Env, randomize: bool = True):
+    def __init__(self, env: F110Env, randomize: bool = True, max_laps: int = cp.MAX_LAPS):
         p = env.params
         if env.num_agents != 1:
             raise ValueError("Phase1Wrapper is single-agent.")
@@ -94,8 +100,11 @@ class Phase1Wrapper:
             raise ValueError(f"Env must produce {ob.NUM_BEAMS}-beam scans.")
         if randomize != (p.dyn_param_sampler is not None):
             raise ValueError("randomize must match whether the env samples vehicle params.")
+        if p.max_num_laps <= max_laps:
+            raise ValueError("the env's winding lap counter must be off (max_num_laps >> max_laps)")
         self._env = env
         self.randomize = randomize
+        self.max_laps = max_laps
         self.track_length = env.track_length
         self.obs_dim = ob.OBS_DIM
         self.action_dim = 2
@@ -133,13 +142,34 @@ class Phase1Wrapper:
             steer_offset=steer_offset,
             stack=stack,
             prev_action=prev_action,
-            ep_return=jnp.array(0.0),
-            ep_length=jnp.array(0, dtype=jnp.int32),
-            ep_speed_sum=jnp.array(0.0),
-            ep_progress=jnp.array(0.0),
+            ep_return=jnp.zeros((), jnp.float32),
+            ep_length=jnp.zeros((), jnp.int32),
+            ep_speed_sum=jnp.zeros((), jnp.float32),
+            ep_progress=jnp.zeros((), jnp.float32),
         )
         speed = env_state.cartesian_states[0, 3]
         return ob.build_obs(stack, speed, prev_action, xp=jnp), state
+
+    def reset_at(self, key: chex.PRNGKey, s: chex.Array) -> Tuple[chex.Array, WrapperState]:
+        """Reset with the car on the centerline at arc length ``s``, heading
+        along the track, speed 0 (fixed evaluation start points)."""
+        k_reset, k_scan, k_noise = jax.random.split(key, 3)
+        _, state = self.reset(k_reset)
+        env = self._env
+        frenet = jnp.array([[s, 0.0, 0.0]])
+        pose = env.track.vmap_frenet_to_cartesian_jax(frenet)
+        x = jnp.zeros_like(state.env_state.cartesian_states).at[:, jnp.array([0, 1, 4])].set(pose)
+        es = state.env_state.replace(
+            cartesian_states=x,
+            last_cartesian_states=x,
+            frenet_states=frenet,
+            last_frenet_states=frenet,
+            prev_winding_vector=x[:, :2] - env.winding_point,
+        )
+        es = env._scan(es, k_scan)
+        stack = ob.init_stack(self._sense(k_noise, es), xp=jnp)
+        state = state.replace(env_state=es, stack=stack)
+        return ob.build_obs(stack, x[0, 3], state.prev_action, xp=jnp), state
 
     # ------------------------------------------------------------------- step
     @partial(jax.jit, static_argnums=(0,))
@@ -159,7 +189,6 @@ class Phase1Wrapper:
         _, env_state, rewards, dones, _ = self._env.step_env(
             k_env, state.env_state, {"agent_0": executed}
         )
-        done = dones["__all__"]
 
         # 4-5. sensing, observation, reward
         stack = ob.push_scan(state.stack, self._sense(k_noise, env_state), xp=jnp)
@@ -173,6 +202,8 @@ class Phase1Wrapper:
         ep_length = state.ep_length + 1
         ep_speed_sum = state.ep_speed_sum + speed
         ep_progress = state.ep_progress + progress_m / self.track_length
+        lap_complete = ep_progress >= self.max_laps
+        done = dones["__all__"] | lap_complete
         cont = state.replace(
             env_state=env_state,
             delay_buffer=delay_buffer,
@@ -192,7 +223,7 @@ class Phase1Wrapper:
             "episode_length": ep_length,
             "episode_mean_speed": ep_speed_sum / ep_length,
             "episode_progress": ep_progress,
-            "lap_complete": env_state.num_laps[0] >= self._env.params.max_num_laps,
+            "lap_complete": lap_complete,
             "collision": collided,
             "timeout": env_state.step >= self._env.params.max_steps,
             "speed": speed,

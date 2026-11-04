@@ -45,6 +45,9 @@ def make_dyn_param_sampler(
     return sampler
 
 
+# Param.max_num_laps used to switch the env's own lap termination off.
+ENV_LAPS_OFF = 1_000_000
+
 # One shared sampler object, so every env's Param hashes the same way.
 DEFAULT_SAMPLER = make_dyn_param_sampler()
 
@@ -90,7 +93,9 @@ def make_param(map_name: str, randomize: bool = True, model: str = "st", **overr
         # episode
         collision_on=True,
         observe_others=False,
-        max_num_laps=cp.MAX_LAPS,
+        # laps are counted from progress in Phase1Wrapper; the env's winding
+        # counter is unreliable on non-star-shaped tracks, so keep it out of reach
+        max_num_laps=ENV_LAPS_OFF,
         max_steps=cp.MAX_STEPS,
         reward_type="progress",
     )

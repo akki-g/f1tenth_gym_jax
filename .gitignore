@@ -177,3 +177,4 @@ rl/third_party/
 rl/maps/*
 !rl/maps/Duct*/
 !rl/maps/manifest.json
+slurm/logs/

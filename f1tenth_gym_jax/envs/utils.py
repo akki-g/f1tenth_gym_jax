@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Dict, Mapping, Sequence, Tuple
+from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import chex
 import jax
@@ -9,6 +9,42 @@ from flax import struct
 from .multi_agent_env import MultiAgentEnv
 
 VALID_REWARDS = frozenset({"time", "progress", "alive"})
+
+# Vehicle parameters that may differ per environment / agent. They are traced
+# through the dynamics instead of being compiled in via the static ``Param``.
+DYN_PARAM_NAMES = ("mu", "C_Sf", "C_Sr", "lf", "lr", "h", "m", "I")
+
+
+@struct.dataclass
+class DynParams:
+    """
+    Traced vehicle parameters, one value per agent when stored in ``State``.
+
+    Inside the vmapped dynamics each field is a scalar.
+    """
+
+    mu: chex.Array  # surface friction coefficient
+    C_Sf: chex.Array  # cornering stiffness coefficient, front
+    C_Sr: chex.Array  # cornering stiffness coefficient, rear
+    lf: chex.Array  # distance from center of gravity to front axle
+    lr: chex.Array  # distance from center of gravity to rear axle
+    h: chex.Array  # height of center of gravity
+    m: chex.Array  # total mass of the vehicle
+    I: chex.Array  # moment of inertia of the entire vehicle about the z axis
+
+    @classmethod
+    def from_param(cls, params: "Param", num_agents: Optional[int] = None):
+        """Nominal values from ``params``, broadcast to ``(num_agents,)`` if given."""
+        if num_agents is None:
+            return cls(
+                **{n: jnp.asarray(getattr(params, n), float) for n in DYN_PARAM_NAMES}
+            )
+        return cls(
+            **{
+                n: jnp.full((num_agents,), getattr(params, n), dtype=float)
+                for n in DYN_PARAM_NAMES
+            }
+        )
 
 
 @struct.dataclass
@@ -41,6 +77,9 @@ class State:
     prev_winding_vector: chex.Array  # [n_agent, 2]
     last_accumulated_angles: chex.Array  # [n_agent, 1]
     accumulated_angles: chex.Array  # [n_agent, 1]
+
+    # per-agent vehicle parameters, each field [n_agent, ]; None -> use Param
+    dyn_params: Optional[DynParams] = None
 
 
 @struct.dataclass
@@ -98,6 +137,12 @@ class Param:
         90 / (timestep * timestep_ratio)
     )  # maximum number of steps to run before done
     reward_type: str = "progress"  # reward types from VALID_REWARDS, joined with "+"
+    # Optional per-reset sampler for the traced vehicle parameters:
+    # sampler(key, nominal: DynParams) -> DynParams, fields shaped [n_agent, ].
+    # None keeps the nominal values above for every agent.
+    dyn_param_sampler: Optional[Callable] = struct.field(
+        pytree_node=False, default=None
+    )
 
 
 def batchify(

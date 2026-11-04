@@ -39,7 +39,7 @@ from .spaces import Box
 from .track import Track
 
 # dataclasses
-from .utils import VALID_REWARDS, Param, State
+from .utils import VALID_REWARDS, DynParams, Param, State
 
 
 def _validate_positive_int(name: str, value: int) -> None:
@@ -279,9 +279,15 @@ class F110Env(MultiAgentEnv):
         # stop collided cars
         us = jnp.where(state.collisions[:, None], jnp.zeros_like(us), us)
         x_and_u = jnp.hstack((x, us))
-        # integrate dynamics, vmapped
-        integrator = jax.vmap(self.integrator_func, in_axes=[None, 0, None])
-        new_x_and_u = integrator(self.model_func, x_and_u, self.params)
+        # integrate dynamics, vmapped over agents (and their vehicle params)
+        if state.dyn_params is None:
+            integrator = jax.vmap(self.integrator_func, in_axes=[None, 0, None])
+            new_x_and_u = integrator(self.model_func, x_and_u, self.params)
+        else:
+            integrator = jax.vmap(self.integrator_func, in_axes=[None, 0, None, 0])
+            new_x_and_u = integrator(
+                self.model_func, x_and_u, self.params, state.dyn_params
+            )
         final_x_and_u = jnp.where(state.collisions[:, None], x_and_u, new_x_and_u)
         state = state.replace(
             last_cartesian_states=state.cartesian_states,
@@ -322,6 +328,12 @@ class F110Env(MultiAgentEnv):
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], State]:
         """Performs resetting of the environment."""
 
+        # per-agent vehicle parameters: nominal, or drawn by the configured sampler
+        dyn_params = DynParams.from_param(self.params, self.num_agents)
+        if self.params.dyn_param_sampler is not None:
+            key, dyn_key = jax.random.split(key)
+            dyn_params = self.params.dyn_param_sampler(dyn_key, dyn_params)
+
         # reset states
         s_key, ey_key = jax.random.split(key)
         # randomly choose first agent location [0, 1] on entire arc length
@@ -359,6 +371,7 @@ class F110Env(MultiAgentEnv):
             prev_winding_vector=jnp.zeros((self.num_agents, 2)),
             accumulated_angles=jnp.zeros((self.num_agents,)),
             last_accumulated_angles=jnp.zeros((self.num_agents,)),
+            dyn_params=dyn_params,
         )
 
         # scan if needed

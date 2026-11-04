@@ -7,6 +7,7 @@ Author: Hongrui Zheng, Renukanandan Tumu
 """
 
 from functools import partial
+from typing import Optional
 
 import chex
 import jax
@@ -14,7 +15,7 @@ import jax
 # jax
 import jax.numpy as jnp
 
-from .utils import Param
+from .utils import DynParams, Param
 
 
 @partial(jax.jit, static_argnums=[1, 2])
@@ -151,7 +152,9 @@ def steering_constraint(
 
 
 @partial(jax.jit, static_argnums=[1])
-def vehicle_dynamics_ks(x_and_u: chex.Array, params: Param) -> chex.Array:
+def vehicle_dynamics_ks(
+    x_and_u: chex.Array, params: Param, dyn_params: Optional[DynParams] = None
+) -> chex.Array:
     """
     Evaluate the kinematic single-track model.
 
@@ -166,6 +169,9 @@ def vehicle_dynamics_ks(x_and_u: chex.Array, params: Param) -> chex.Array:
     params : Param
         Jittable simulation parameters, including geometry, control limits,
         action modes, and timestep.
+    dyn_params : DynParams, optional
+        Traced vehicle parameters (mu, C_Sf, C_Sr, lf, lr, h, m, I). When
+        given they override the values in ``params``.
 
     Returns
     -------
@@ -173,12 +179,13 @@ def vehicle_dynamics_ks(x_and_u: chex.Array, params: Param) -> chex.Array:
         Right-hand side of the kinematic differential equations with two dummy
         control dimensions appended.
     """
+    dp = params if dyn_params is None else dyn_params
     # Controls
     DELTA = x_and_u[2]
     V = x_and_u[3]
     PSI = x_and_u[4]
     # wheelbase
-    lwb = params.lf + params.lr
+    lwb = dp.lf + dp.lr
 
     # control type
     if params.steering_action_type == "steeringvelocity":
@@ -215,7 +222,9 @@ def vehicle_dynamics_ks(x_and_u: chex.Array, params: Param) -> chex.Array:
 
 
 @partial(jax.jit, static_argnums=[1])
-def vehicle_dynamics_st_switching(x_and_u: chex.Array, params: Param) -> chex.Array:
+def vehicle_dynamics_st_switching(
+    x_and_u: chex.Array, params: Param, dyn_params: Optional[DynParams] = None
+) -> chex.Array:
     """
     Evaluate the switching dynamic single-track model.
 
@@ -231,6 +240,9 @@ def vehicle_dynamics_st_switching(x_and_u: chex.Array, params: Param) -> chex.Ar
     params : Param
         Jittable simulation parameters, including geometry, tire coefficients,
         control limits, action modes, and timestep.
+    dyn_params : DynParams, optional
+        Traced vehicle parameters (mu, C_Sf, C_Sr, lf, lr, h, m, I). When
+        given they override the values in ``params``.
 
     Returns
     -------
@@ -238,6 +250,7 @@ def vehicle_dynamics_st_switching(x_and_u: chex.Array, params: Param) -> chex.Ar
         Right-hand side of the single-track differential equations with two
         dummy control dimensions appended.
     """
+    dp = params if dyn_params is None else dyn_params
     # States
     DELTA = x_and_u[2]
     V = jnp.clip(x_and_u[3], min=0.001)
@@ -271,11 +284,11 @@ def vehicle_dynamics_st_switching(x_and_u: chex.Array, params: Param) -> chex.Ar
 
     # switch to kinematic model for small velocities
     # wheelbase
-    lwb = params.lf + params.lr
-    BETA_HAT = jnp.arctan(jnp.tan(DELTA) * params.lr / lwb)
+    lwb = dp.lf + dp.lr
+    BETA_HAT = jnp.arctan(jnp.tan(DELTA) * dp.lr / lwb)
     BETA_DOT = (
-        (1 / (1 + (jnp.tan(DELTA) * (params.lr / lwb)) ** 2))
-        * (params.lr / (lwb * jnp.cos(DELTA) ** 2))
+        (1 / (1 + (jnp.tan(DELTA) * (dp.lr / lwb)) ** 2))
+        * (dp.lr / (lwb * jnp.cos(DELTA) ** 2))
         * STEER_VEL
     )
     f_ks = jnp.array(
@@ -305,37 +318,37 @@ def vehicle_dynamics_st_switching(x_and_u: chex.Array, params: Param) -> chex.Ar
             STEER_VEL,  # DELTA_DOT
             ACCL,  # V_DOT
             PSI_DOT,  # PSI_DOT
-            ((params.mu * params.m) / (params.I * (params.lf + params.lr)))
+            ((dp.mu * dp.m) / (dp.I * (dp.lf + dp.lr)))
             * (
-                params.lf * params.C_Sf * (g * params.lr - ACCL * params.h) * DELTA
+                dp.lf * dp.C_Sf * (g * dp.lr - ACCL * dp.h) * DELTA
                 + (
-                    params.lr * params.C_Sr * (g * params.lf + ACCL * params.h)
-                    - params.lf * params.C_Sf * (g * params.lr - ACCL * params.h)
+                    dp.lr * dp.C_Sr * (g * dp.lf + ACCL * dp.h)
+                    - dp.lf * dp.C_Sf * (g * dp.lr - ACCL * dp.h)
                 )
                 * BETA
                 - (
-                    params.lf
-                    * params.lf
-                    * params.C_Sf
-                    * (g * params.lr - ACCL * params.h)
-                    + params.lr
-                    * params.lr
-                    * params.C_Sr
-                    * (g * params.lf + ACCL * params.h)
+                    dp.lf
+                    * dp.lf
+                    * dp.C_Sf
+                    * (g * dp.lr - ACCL * dp.h)
+                    + dp.lr
+                    * dp.lr
+                    * dp.C_Sr
+                    * (g * dp.lf + ACCL * dp.h)
                 )
                 * (PSI_DOT / V)
             ),  # PSI_DOT_DOT
-            (params.mu / (V * (params.lr + params.lf)))
+            (dp.mu / (V * (dp.lr + dp.lf)))
             * (
-                params.C_Sf * (g * params.lr - ACCL * params.h) * DELTA
+                dp.C_Sf * (g * dp.lr - ACCL * dp.h) * DELTA
                 - (
-                    params.C_Sr * (g * params.lf + ACCL * params.h)
-                    + params.C_Sf * (g * params.lr - ACCL * params.h)
+                    dp.C_Sr * (g * dp.lf + ACCL * dp.h)
+                    + dp.C_Sf * (g * dp.lr - ACCL * dp.h)
                 )
                 * BETA
                 + (
-                    params.C_Sr * (g * params.lf + ACCL * params.h) * params.lr
-                    - params.C_Sf * (g * params.lr - ACCL * params.h) * params.lf
+                    dp.C_Sr * (g * dp.lf + ACCL * dp.h) * dp.lr
+                    - dp.C_Sf * (g * dp.lr - ACCL * dp.h) * dp.lf
                 )
                 * (PSI_DOT / V)
             )
@@ -351,7 +364,9 @@ def vehicle_dynamics_st_switching(x_and_u: chex.Array, params: Param) -> chex.Ar
 
 
 @partial(jax.jit, static_argnums=[1])
-def vehicle_dynamics_st_smooth(x_and_u: chex.Array, params: Param) -> chex.Array:
+def vehicle_dynamics_st_smooth(
+    x_and_u: chex.Array, params: Param, dyn_params: Optional[DynParams] = None
+) -> chex.Array:
     """
     Evaluate the smoothly blended dynamic single-track model.
 
@@ -367,6 +382,9 @@ def vehicle_dynamics_st_smooth(x_and_u: chex.Array, params: Param) -> chex.Array
     params : Param
         Jittable simulation parameters, including geometry, tire coefficients,
         control limits, action modes, and timestep.
+    dyn_params : DynParams, optional
+        Traced vehicle parameters (mu, C_Sf, C_Sr, lf, lr, h, m, I). When
+        given they override the values in ``params``.
 
     Returns
     -------
@@ -374,6 +392,7 @@ def vehicle_dynamics_st_smooth(x_and_u: chex.Array, params: Param) -> chex.Array
         Right-hand side of the blended single-track differential equations with
         two dummy control dimensions appended.
     """
+    dp = params if dyn_params is None else dyn_params
     # States
     DELTA = x_and_u[2]
     V = jnp.clip(x_and_u[3], min=0.001)
@@ -407,11 +426,11 @@ def vehicle_dynamics_st_smooth(x_and_u: chex.Array, params: Param) -> chex.Array
 
     # switch to kinematic model for small velocities
     # wheelbase
-    lwb = params.lf + params.lr
-    BETA_HAT = jnp.arctan(jnp.tan(DELTA) * params.lr / lwb)
+    lwb = dp.lf + dp.lr
+    BETA_HAT = jnp.arctan(jnp.tan(DELTA) * dp.lr / lwb)
     BETA_DOT = (
-        (1 / (1 + (jnp.tan(DELTA) * (params.lr / lwb)) ** 2))
-        * (params.lr / (lwb * jnp.cos(DELTA) ** 2))
+        (1 / (1 + (jnp.tan(DELTA) * (dp.lr / lwb)) ** 2))
+        * (dp.lr / (lwb * jnp.cos(DELTA) ** 2))
         * STEER_VEL
     )
     f_ks = jnp.array(
@@ -441,37 +460,37 @@ def vehicle_dynamics_st_smooth(x_and_u: chex.Array, params: Param) -> chex.Array
             STEER_VEL,  # DELTA_DOT
             ACCL,  # V_DOT
             PSI_DOT,  # PSI_DOT
-            ((params.mu * params.m) / (params.I * (params.lf + params.lr)))
+            ((dp.mu * dp.m) / (dp.I * (dp.lf + dp.lr)))
             * (
-                params.lf * params.C_Sf * (g * params.lr - ACCL * params.h) * DELTA
+                dp.lf * dp.C_Sf * (g * dp.lr - ACCL * dp.h) * DELTA
                 + (
-                    params.lr * params.C_Sr * (g * params.lf + ACCL * params.h)
-                    - params.lf * params.C_Sf * (g * params.lr - ACCL * params.h)
+                    dp.lr * dp.C_Sr * (g * dp.lf + ACCL * dp.h)
+                    - dp.lf * dp.C_Sf * (g * dp.lr - ACCL * dp.h)
                 )
                 * BETA
                 - (
-                    params.lf
-                    * params.lf
-                    * params.C_Sf
-                    * (g * params.lr - ACCL * params.h)
-                    + params.lr
-                    * params.lr
-                    * params.C_Sr
-                    * (g * params.lf + ACCL * params.h)
+                    dp.lf
+                    * dp.lf
+                    * dp.C_Sf
+                    * (g * dp.lr - ACCL * dp.h)
+                    + dp.lr
+                    * dp.lr
+                    * dp.C_Sr
+                    * (g * dp.lf + ACCL * dp.h)
                 )
                 * (PSI_DOT / V)
             ),  # PSI_DOT_DOT
-            (params.mu / (V * (params.lr + params.lf)))
+            (dp.mu / (V * (dp.lr + dp.lf)))
             * (
-                params.C_Sf * (g * params.lr - ACCL * params.h) * DELTA
+                dp.C_Sf * (g * dp.lr - ACCL * dp.h) * DELTA
                 - (
-                    params.C_Sr * (g * params.lf + ACCL * params.h)
-                    + params.C_Sf * (g * params.lr - ACCL * params.h)
+                    dp.C_Sr * (g * dp.lf + ACCL * dp.h)
+                    + dp.C_Sf * (g * dp.lr - ACCL * dp.h)
                 )
                 * BETA
                 + (
-                    params.C_Sr * (g * params.lf + ACCL * params.h) * params.lr
-                    - params.C_Sf * (g * params.lr - ACCL * params.h) * params.lf
+                    dp.C_Sr * (g * dp.lf + ACCL * dp.h) * dp.lr
+                    - dp.C_Sf * (g * dp.lr - ACCL * dp.h) * dp.lf
                 )
                 * (PSI_DOT / V)
             )

@@ -37,7 +37,7 @@ def compile_counter():
 # --------------------------------------------------------------------------
 import numpy as np  # noqa: E402
 
-from rl.maps import use_map_dir, write_map  # noqa: E402
+from rl.maps import DEFAULT_MAP_DIR, use_map_dir, write_map  # noqa: E402
 
 # FineBox: 6 m x 6 m room at 5 mm/px, walls 5 cm thick, inner face at x = +-2.95 m.
 FINE_RES = 0.005
@@ -56,8 +56,15 @@ def _box_map(map_dir, name, half, res, wall, radius):
 
 
 @pytest.fixture(scope="session")
-def test_map_dir(tmp_path_factory):
-    map_dir = use_map_dir(tmp_path_factory.mktemp("maps"))
-    _box_map(map_dir, "FineBox", FINE_HALF, FINE_RES, FINE_WALL, radius=1.5)
-    _box_map(map_dir, "OpenBox", 50.0, 0.05, 0.5, radius=30.0)
+def test_map_dir():
+    """Synthetic test maps, written next to the training maps (gitignored).
+
+    One map directory for every test: the env finds maps through a single
+    environment variable, so per-test directories would fight over it.
+    """
+    map_dir = use_map_dir(DEFAULT_MAP_DIR)
+    if not (map_dir / "FineBox" / "FineBox.png").exists():
+        _box_map(map_dir, "FineBox", FINE_HALF, FINE_RES, FINE_WALL, radius=1.5)
+    if not (map_dir / "OpenBox" / "OpenBox.png").exists():
+        _box_map(map_dir, "OpenBox", 50.0, 0.05, 0.5, radius=30.0)
     return map_dir

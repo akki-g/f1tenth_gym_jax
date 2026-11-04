@@ -243,11 +243,19 @@ class F110Env(MultiAgentEnv):
         self.track = Track.from_track_name(params.map_name)
         self.track_length = jnp.max(self.track.centerline.s)
 
-        # get a interior point of track as winding number looking point
-        start_point_curvature = self.track.centerline.calc_curvature(0.0)
+        # get a interior point of track as winding number looking point.
+        # The loop's inside is on the left of the centerline for a
+        # counter-clockwise loop (positive signed area). The curvature at
+        # s = 0 is not a reliable guide: it is ~0 on a straight and distorted
+        # by the open spline's end condition at the seam.
+        cl_xs = np.asarray(self.track.centerline.xs)
+        cl_ys = np.asarray(self.track.centerline.ys)
+        signed_area = 0.5 * np.sum(
+            cl_xs * np.roll(cl_ys, -1) - np.roll(cl_xs, -1) * cl_ys
+        )
         self.winding_point = jnp.array(
             self.track.frenet_to_cartesian(
-                s=0.0, ey=np.sign(start_point_curvature) * 1.5, ephi=0.0
+                s=0.0, ey=np.sign(signed_area) * 1.5, ephi=0.0
             )
         )[:2]
         # get racing direction

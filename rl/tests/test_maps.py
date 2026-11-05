@@ -6,13 +6,31 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from matplotlib.path import Path
 from PIL import Image
 from scipy.ndimage import distance_transform_edt as edt
 
 from rl import maps as M
 
 ALL_GEN = M.TRAIN_GEN_SEEDS + M.HELDOUT_GEN_SEEDS
+
+
+def point_in_polygon(poly, p) -> bool:
+    """Even-odd ray casting (a closed polygon given as an (N, 2) vertex array)."""
+    x, y = poly[:, 0], poly[:, 1]
+    xn, yn = np.roll(x, -1), np.roll(y, -1)
+    crosses = (y > p[1]) != (yn > p[1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        x_at = x + (p[1] - y) * (xn - x) / (yn - y)
+    return bool(np.count_nonzero(crosses & (p[0] < x_at)) % 2)
+
+
+def test_point_in_polygon():
+    square = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])
+    assert point_in_polygon(square, (1.0, 1.0))
+    assert not point_in_polygon(square, (3.0, 1.0))
+    assert not point_in_polygon(square, (1.0, -0.5))
+    u = np.array([[0, 0], [3, 0], [3, 3], [2, 3], [2, 1], [1, 1], [1, 3], [0, 3]], float)
+    assert point_in_polygon(u, (0.5, 2.0)) and not point_in_polygon(u, (1.5, 2.0))
 
 
 @pytest.fixture(scope="module")
@@ -72,7 +90,7 @@ def test_winding_point_inside_every_loop(prepared):
         t = env.track
         s = np.linspace(0, float(t.centerline.s[-1]), 600, endpoint=False)
         loop = np.array([t.centerline.calc_position(si) for si in s])
-        assert Path(loop).contains_point(np.asarray(env.winding_point)), name
+        assert point_in_polygon(loop, np.asarray(env.winding_point)), name
 
 
 def _pure_pursuit_lap(name, speed=2.5, lookahead=1.0, steps=2000):

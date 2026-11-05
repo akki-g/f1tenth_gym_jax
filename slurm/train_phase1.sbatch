@@ -10,7 +10,8 @@
 # directory's latest checkpoint: the directory is named <date>_<config hash>
 # and train_ppo.py picks up an existing one with the same hash.
 #
-# One-time setup on the login node first: bash slurm/setup_newton.sh
+# One-time setup on the login node first: bash slurm/setup_newton.sh, then
+# the validation gate (slurm/gate_tests.sbatch); chain the smoke run on it.
 #
 #SBATCH --job-name=rl-phase1
 #SBATCH --gres=gpu:1
@@ -43,7 +44,11 @@ import json, pathlib, sys
 m = pathlib.Path("rl/maps/manifest.json")
 if not m.exists():
     sys.exit("rl/maps/manifest.json missing: run `uv run python -m rl.maps prepare` on the login node")
-print("maps:", len(json.loads(m.read_text())["maps"]))
+names = json.loads(m.read_text())["maps"]
+missing = [n for n in names if not (m.parent / n).is_dir()]  # the manifest is in git; the racetracks are not
+if missing:
+    sys.exit(f"tracks missing on disk: {missing}: run `uv run python -m rl.maps prepare` on the login node")
+print("maps:", len(names))
 PY
 
 case "$MODE" in

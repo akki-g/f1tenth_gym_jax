@@ -4,7 +4,8 @@
 #   Smoke run (10 min, 256 envs):
 #     sbatch --time=00:20:00 --export=ALL,MODE=smoke slurm/train_phase1.sbatch
 #   12-hour job (full config; set TOTAL_TIMESTEPS from the smoke run's sps):
-#     sbatch --export=ALL,MODE=full,TOTAL_TIMESTEPS=2e8 slurm/train_phase1.sbatch
+#     sbatch --export=ALL,MODE=full,TOTAL_TIMESTEPS=1.18e9 slurm/train_phase1.sbatch
+#   (1.18e9 = 31,736 steps/s measured at 2048 envs on a Newton H100 PCIe x 41400 s x 0.9)
 #
 # Restarting (requeue, or the same sbatch line again) resumes from the run
 # directory's latest checkpoint: the directory is named <date>_<config hash>
@@ -76,7 +77,10 @@ case "$MODE" in
   *) echo "unknown MODE=$MODE (smoke|full)"; exit 2 ;;
 esac
 
-srun uv run --frozen python -m rl.train_ppo "${ARGS[@]}" --wandb-mode offline "$@"
+# no srun: under srun the smoke job hung for 7 min after training finished
+# (srun keeps the step open while a leftover child holds its output stream);
+# launched directly, the same run exits cleanly. One task, so srun adds nothing.
+uv run --frozen python -m rl.train_ppo "${ARGS[@]}" --wandb-mode offline "$@"
 
 if [ "$MODE" = smoke ]; then
   RUN_DIR=$(ls -td runs/smoke/*/ | head -1)

@@ -40,15 +40,26 @@ uv run --frozen python -c "import jax; print('jax', jax.__version__, jax.devices
 
 # the tracks must already be on disk (compute nodes may have no internet)
 uv run --frozen python - <<'PY'
-import json, pathlib, sys
+import hashlib, json, pathlib, sys
+from f1tenth_gym_jax.envs.track.utils import get_map_search_dirs  # where the env looks; never downloads
 m = pathlib.Path("rl/maps/manifest.json")
 if not m.exists():
     sys.exit("rl/maps/manifest.json missing: run `uv run python -m rl.maps prepare` on the login node")
-names = json.loads(m.read_text())["maps"]
-missing = [n for n in names if not (m.parent / n).is_dir()]  # the manifest is in git; the racetracks are not
-if missing:
-    sys.exit(f"tracks missing on disk: {missing}: run `uv run python -m rl.maps prepare` on the login node")
-print("maps:", len(names))
+maps = json.loads(m.read_text())["maps"]
+dirs = get_map_search_dirs()
+bad = []
+for name, entry in maps.items():  # the manifest is in git, the racetracks are not: check the files
+    found = next((d / name for d in dirs if (d / name).is_dir()), None)
+    if found is None:
+        bad.append(f"{name}: not found in {[str(d) for d in dirs]}")
+        continue
+    for fname, digest in entry["files"].items():
+        p = found / fname
+        if not p.exists() or hashlib.sha256(p.read_bytes()).hexdigest() != digest:
+            bad.append(f"{name}/{fname}: missing or hash differs from the manifest")
+if bad:
+    sys.exit("track check failed (run `uv run python -m rl.maps prepare` on the login node):\n  " + "\n  ".join(bad))
+print("maps:", len(maps), "all files match the manifest")
 PY
 
 case "$MODE" in

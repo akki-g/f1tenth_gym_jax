@@ -415,7 +415,7 @@ class F110Env(MultiAgentEnv):
         # randomly choose first agent location [0, 1] on entire arc length
         first_agent_s_loc = jax.random.uniform(s_key)
         first_agent_s = first_agent_s_loc * self.track.length
-        first_agent_ey = jax.random.uniform(ey_key, minval=-0.3, maxval=0.3)
+        first_agent_ey = jax.random.uniform(ey_key, minval=-0.3, maxval=0.3) * self.params.reset_ey_scale
         # set up following agents in a grid pattern
         s_locs = jnp.linspace(
             first_agent_s,

@@ -292,3 +292,63 @@ def test_wall_buffer_window_matches_full_map_check(test_map_dir, name):
         assert got == want, (i, x, y, yaw, float(margin))
         hits += want
     assert 20 < hits < 280  # both outcomes exercised
+
+
+# ---------------------------------------------------------------------------
+# Rollover (lab fine-tune)
+# ---------------------------------------------------------------------------
+def test_tip_limits_nominal_and_randomized():
+    from rl.wrappers import tip_limits
+
+    g = cp.GRAVITY
+    left, right = (float(x) for x in tip_limits(jax.random.PRNGKey(0), randomize=False))
+    mid, dyn = sum(cp.TIP_ANGLE_DEG) / 2, sum(cp.TIP_DYNAMIC) / 2
+    assert left == pytest.approx(np.tan(np.radians(mid + cp.TIP_ASYM_DEG)) * g * dyn, rel=1e-5)
+    assert right == pytest.approx(np.tan(np.radians(mid - cp.TIP_ASYM_DEG)) * g * dyn, rel=1e-5)
+    assert left > right  # the battery side (left wheels, right turns) tips first
+    ls, rs = jax.vmap(lambda k: tip_limits(k, True))(jax.random.split(jax.random.PRNGKey(1), N_ENVS))
+    ls, rs = np.asarray(ls), np.asarray(rs)
+    lo = np.tan(np.radians(cp.TIP_ANGLE_DEG[0] - cp.TIP_ASYM_DEG)) * g * cp.TIP_DYNAMIC[0]
+    hi = np.tan(np.radians(cp.TIP_ANGLE_DEG[1] + cp.TIP_ASYM_DEG)) * g * cp.TIP_DYNAMIC[1]
+    assert ls.min() >= lo - 1e-4 and ls.max() <= hi + 1e-4 and rs.min() >= lo - 1e-4
+    assert np.all(ls > rs) and len(np.unique(ls)) == N_ENVS
+
+
+def test_left_steering_turns_left_with_positive_lateral_accel(test_map_dir):
+    """A positive steering action (a_s > 0) yaws the car counter-clockwise: the
+    wrapper's left-turn limit (the higher one) applies to positive v * yaw_rate."""
+    from rl.wrappers import lateral_accel
+
+    env = _fine_env(stall_steps=0, wrong_way_steps=0)
+    _, ws = env.reset_at(jax.random.PRNGKey(0), jnp.array(0.0))
+    for t in range(8):
+        _, ws, _, done, info = env.step(jax.random.PRNGKey(t), ws, jnp.array([-0.6, 1.0]))  # 1.6 m/s, full left
+        assert not bool(done)
+    assert float(ws.env_state.cartesian_states[0, 5]) > 0.5 and float(lateral_accel(ws.env_state)) > 0.5
+    assert float(info["lat_accel"]) == pytest.approx(float(lateral_accel(ws.env_state)))
+
+
+@pytest.mark.parametrize("a_lat, rolls", [(20.0, True), (-20.0, True), (9.0, False), (-9.0, True), (3.0, False)])
+def test_rollover_threshold_by_turn_direction(test_map_dir, monkeypatch, a_lat, rolls):
+    """Nominal limits ~9.6 m/s^2 (left turns) and ~8.4 (right turns): 9 m/s^2 tips the
+    car only in a right turn. It takes ROLL_STEPS steps above the limit, and
+    nothing ends the episode with rollover off."""
+    from rl import wrappers
+
+    left, right = (float(x) for x in wrappers.tip_limits(jax.random.PRNGKey(0), randomize=False))
+    assert right < 9.0 < left
+    monkeypatch.setattr(wrappers, "lateral_accel", lambda es: jnp.asarray(a_lat, jnp.float32))
+    hold = jnp.array([-1.0, 0.0])
+    for on in (True, False):
+        env = _fine_env(stall_steps=0, wrong_way_steps=0, rollover=on)  # a new instance: traced with the patch
+        _, ws = env.reset_at(jax.random.PRNGKey(0), jnp.array(0.0))
+        ended = None
+        for t in range(1, cp.ROLL_STEPS + 3):
+            _, ws, reward, done, info = env.step(jax.random.PRNGKey(t), ws, hold)
+            if bool(done):
+                ended = t
+                break
+        if on and rolls:
+            assert ended == cp.ROLL_STEPS and bool(info["rollover"]) and float(reward) < -0.9
+        else:
+            assert ended is None and not bool(info["rollover"])

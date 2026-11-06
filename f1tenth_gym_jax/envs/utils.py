@@ -148,6 +148,7 @@ class Param:
     scan_other_agents: bool = False  # scans also hit the other cars' footprints
     observe_others: bool = True  # whether can observe other agents
     map_name: str = "Spielberg"  # map for environment
+    reset_ey_scale: float = 1.0  # scales the reset's lateral offset (agent 0: up to +-0.45 m), < 1 on narrow maps
     max_num_laps: int = 1  # maximum number of laps to run before done
     max_steps: int = int(
         90 / (timestep * timestep_ratio)

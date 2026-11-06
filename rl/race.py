@@ -346,6 +346,8 @@ class RaceWrapper(Phase1Wrapper):
             "wall_buffer": buffer_hit & ~contact,
             "wrong_way": wrong_way,
             "stall": stall,
+            "rollover": jnp.zeros((), bool),  # phase 2 does not model tipping
+            "lat_accel": jnp.zeros((), jnp.float32),
             "margin": st.margin,
             "timeout": timeout,
             "speed": speed,

@@ -91,6 +91,29 @@ WRONG_WAY_STEPS = 13
 # Stall: below STALL_SPEED for 2 s (e.g. pinned or stopped against a wall).
 STALL_SPEED = 0.2  # m/s
 STALL_STEPS = 50
+# Rollover (lab fine-tune; off by default). The single-track model cannot tip,
+# so the wrapper ends an episode when the lateral acceleration v * yaw_rate
+# stays above the car's tipping limit for ROLL_STEPS policy steps. Per episode
+# the limit is tan(angle) * g * dynamic, angle ~ U(TIP_ANGLE_DEG) plus
+# TIP_ASYM_DEG in left turns and minus it in right turns (the battery sits on
+# the car's left, so it tips over its left wheels sooner), dynamic ~
+# U(TIP_DYNAMIC) for body roll and turn-in transients (a moving car tips
+# before the static tilt angle). Nominal episodes use the midpoints.
+TIP_ANGLE_DEG = (45.0, 50.0)  # static tilt test, ~50 deg on both sides (rough)
+TIP_ASYM_DEG = 1.5  # ~0.4 kg battery ~7 cm left of centre
+TIP_DYNAMIC = (0.75, 0.95)
+ROLL_STEPS = 2  # policy steps (80 ms) above the limit
+GRAVITY = 9.81  # m/s^2
+# Lab fine-tune (carpet, air-duct walls, the car's measured ~0.2 s turn response)
+LAB_FRICTION = (1.1, 1.5)  # mu range (carpet); nominal is the midpoint
+LAB_MAX_DELAY_STEPS = 6  # action delay 0..6 policy steps (0-240 ms)
+LAB_MAX_LAPS = 5  # laps per training episode on 10-20 m tracks
+# Reset offset: the env starts agent 0 up to RESET_EY_MAX off the centerline.
+# make_param shrinks that on maps whose narrowest half-width leaves less than
+# RESET_CLEARANCE (half the car, the widest wall buffer, 5 cm) beside it;
+# every phase-1/1c map keeps the full offset.
+RESET_EY_MAX = 0.45  # m (0.3 * 1.5 in F110Env.reset)
+RESET_CLEARANCE = WIDTH / 2 + WALL_MARGIN * (1 + WALL_MARGIN_NOISE) + 0.05  # m
 
 
 def scan_origin_offset(ref_from_rear_axle: float) -> float:

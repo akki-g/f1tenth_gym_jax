@@ -45,11 +45,50 @@ def make_dyn_param_sampler(
     return sampler
 
 
+@functools.lru_cache(maxsize=None)
+def _friction_sampler(mu_sigma: float):
+    return make_dyn_param_sampler({**cp.SIGMA, "mu": mu_sigma})
+
+
+def friction_overrides(friction, randomize: bool) -> dict:
+    """make_param overrides for a friction range (lo, hi): nominal mu at the
+    midpoint and, with ``randomize``, a sampler whose clipped factor reaches
+    lo and hi (other parameters as car_params). Empty range: no overrides."""
+    if not friction:
+        return {}
+    lo, hi = (float(x) for x in friction)
+    if not 0.0 < lo < hi:
+        raise ValueError(f"friction range must satisfy 0 < lo < hi, got {friction}")
+    mid = (lo + hi) / 2.0
+    out = {"mu": mid}
+    if randomize:
+        out["dyn_param_sampler"] = _friction_sampler(round((hi - lo) / (2.0 * cp.CLIP_SIGMAS * mid), 9))
+    return out
+
+
 # Param.max_num_laps used to switch the env's own lap termination off.
 ENV_LAPS_OFF = 1_000_000
 
 # One shared sampler object, so every env's Param hashes the same way.
 DEFAULT_SAMPLER = make_dyn_param_sampler()
+
+
+def reset_ey_scale(map_name: str) -> float:
+    """Scale for the env's reset offset so the car starts clear of the walls on
+    narrow maps: (narrowest half-width - RESET_CLEARANCE) / RESET_EY_MAX,
+    clipped to [0, 1]. 1.0 when the map's centerline file is not in the map
+    dir (e.g. Spielberg, which ships with the env and is wide)."""
+    import os
+    import pathlib
+
+    import numpy as np
+
+    root = os.environ.get("F1TENTH_GYM_JAX_MAP_DIR")
+    path = pathlib.Path(root) / map_name / f"{map_name}_centerline.csv" if root else None
+    if path is None or not path.exists():
+        return 1.0
+    widths = np.loadtxt(path, delimiter=",", comments="#", ndmin=2)[:, 2:4]
+    return float(np.clip((widths.min() - cp.RESET_CLEARANCE) / cp.RESET_EY_MAX, 0.0, 1.0))
 
 
 @functools.lru_cache(maxsize=None)
@@ -97,6 +136,7 @@ def make_param(map_name: str, randomize: bool = True, model: str = "st", **overr
         # counter is unreliable on non-star-shaped tracks, so keep it out of reach
         max_num_laps=ENV_LAPS_OFF,
         max_steps=cp.MAX_STEPS,
+        reset_ey_scale=reset_ey_scale(map_name),
         reward_type="progress",
     )
     kwargs.update(overrides)

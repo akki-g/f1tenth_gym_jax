@@ -14,8 +14,10 @@ Stages, innermost first, as the spec orders them:
 Episode ends (each with the collision penalty): env collision; the wall
 buffer (the collision box inflated by ``wall_margin`` per side, randomized
 +-30% per episode); wrong way (heading > 90 deg off the track direction for
-``wrong_way_steps``); stall (speed < STALL_SPEED for ``stall_steps``). They use
-the sim's exact pose and track position; nothing changes on the car.
+``wrong_way_steps``); stall (speed < STALL_SPEED for ``stall_steps``); with
+``rollover``, tipping (|v * yaw_rate| above this episode's tipping limit for
+the turn's direction, for ROLL_STEPS steps; car_params). They use the sim's
+exact state and track position; nothing changes on the car.
 
 Laps are counted from accumulated centerline progress (``max_laps``, 2 for
 training) and end the episode here. The env's own winding-number lap
@@ -67,6 +69,9 @@ class WrapperState:
     margin: chex.Array  # m per side, this episode's wall buffer
     wrong_way_count: chex.Array  # consecutive steps pointing the wrong way
     stall_count: chex.Array  # consecutive steps below STALL_SPEED
+    tip_left: chex.Array  # m/s^2, this episode's tipping limit in left turns
+    tip_right: chex.Array  # m/s^2, in right turns
+    roll_count: chex.Array  # consecutive steps above the tipping limit
 
 
 def delay_action(buffer, k, command):
@@ -87,6 +92,25 @@ def lidar_noise(key, ranges, noise_std=cp.RANGE_NOISE_STD, dropout=cp.DROPOUT_PR
     noisy = jnp.clip(noisy, 0.0, cp.MAX_RANGE)
     drop = jax.random.bernoulli(k_drop, dropout, ranges.shape)
     return jnp.where(drop, cp.MAX_RANGE, noisy)
+
+
+def tip_limits(key, randomize):
+    """(left-turn, right-turn) tipping limits in m/s^2 for one episode (car_params)."""
+    if randomize:
+        k_angle, k_dyn = jax.random.split(key)
+        angle = jax.random.uniform(k_angle, (), minval=cp.TIP_ANGLE_DEG[0], maxval=cp.TIP_ANGLE_DEG[1])
+        dyn = jax.random.uniform(k_dyn, (), minval=cp.TIP_DYNAMIC[0], maxval=cp.TIP_DYNAMIC[1])
+    else:
+        angle = jnp.array(sum(cp.TIP_ANGLE_DEG) / 2)
+        dyn = jnp.array(sum(cp.TIP_DYNAMIC) / 2)
+    left = jnp.tan(jnp.radians(angle + cp.TIP_ASYM_DEG)) * cp.GRAVITY * dyn
+    right = jnp.tan(jnp.radians(angle - cp.TIP_ASYM_DEG)) * cp.GRAVITY * dyn
+    return left.astype(jnp.float32), right.astype(jnp.float32)
+
+
+def lateral_accel(env_state):
+    """v * yaw_rate of agent 0, m/s^2; positive in left turns."""
+    return env_state.cartesian_states[0, 3] * env_state.cartesian_states[0, 5]
 
 
 def step_reward(progress_m, track_length, action, prev_action, collided):
@@ -115,6 +139,7 @@ class Phase1Wrapper:
         stall_steps: int = cp.STALL_STEPS,
         frame_stack: int = ob.FRAME_STACK,
         max_delay: int = cp.MAX_DELAY_STEPS,
+        rollover: bool = False,
     ):
         p = env.params
         if env.num_agents != self.NUM_AGENTS:
@@ -141,6 +166,7 @@ class Phase1Wrapper:
         self.wall_margin_noise = float(wall_margin_noise)
         self.wrong_way_steps = int(wrong_way_steps)
         self.stall_steps = int(stall_steps)
+        self.rollover = bool(rollover)
         # wall-buffer check on a window of the map around the car, sized to
         # cover the largest inflated footprint (same test as the env's
         # collision_map, without scanning every wall pixel of the map)
@@ -205,6 +231,7 @@ class Phase1Wrapper:
         k_env, k_ep, k_noise = jax.random.split(key, 3)
         _, env_state = self._env.reset(k_env)
         delay_k, steer_offset, margin = self._episode_draws(k_ep)
+        tip_left, tip_right = tip_limits(jax.random.fold_in(k_ep, 7), self.randomize)  # own stream: the other draws keep theirs
         stack = ob.init_stack(self._sense(k_noise, env_state), self.frame_stack, xp=jnp)
         prev_action = ob.reset_action(xp=jnp)
         state = WrapperState(
@@ -221,6 +248,9 @@ class Phase1Wrapper:
             margin=margin,
             wrong_way_count=jnp.zeros((), jnp.int32),
             stall_count=jnp.zeros((), jnp.int32),
+            tip_left=tip_left,
+            tip_right=tip_right,
+            roll_count=jnp.zeros((), jnp.int32),
         )
         speed = env_state.cartesian_states[0, 3]
         return ob.build_obs(stack, speed, prev_action, xp=jnp), state
@@ -279,7 +309,11 @@ class Phase1Wrapper:
         wrong_way = (self.wrong_way_steps > 0) & (wrong_way_count >= self.wrong_way_steps)
         stall_count = jnp.where(speed < cp.STALL_SPEED, state.stall_count + 1, 0).astype(jnp.int32)
         stall = (self.stall_steps > 0) & (stall_count >= self.stall_steps)
-        failed = collided | wrong_way | stall
+        lat_accel = lateral_accel(env_state)
+        tip = jnp.where(lat_accel >= 0.0, state.tip_left, state.tip_right)
+        roll_count = jnp.where(jnp.abs(lat_accel) > tip, state.roll_count + 1, 0).astype(jnp.int32)
+        rolled = self.rollover & (roll_count >= cp.ROLL_STEPS)
+        failed = collided | wrong_way | stall | rolled
         progress_m = rewards["agent_0"]
         reward = step_reward(progress_m, self.track_length, action, state.prev_action, failed)
 
@@ -300,6 +334,7 @@ class Phase1Wrapper:
             ep_progress=ep_progress,
             wrong_way_count=wrong_way_count,
             stall_count=stall_count,
+            roll_count=roll_count,
         )
 
         dp = env_state.dyn_params
@@ -316,6 +351,8 @@ class Phase1Wrapper:
             "wall_buffer": buffer_hit & ~contact,
             "wrong_way": wrong_way,
             "stall": stall,
+            "rollover": rolled,
+            "lat_accel": lat_accel,
             "margin": state.margin,
             "timeout": env_state.step >= self._env.params.max_steps,
             "speed": speed,

@@ -380,7 +380,9 @@ class MultiMapEnv:
     over maps unrolls inside jit.
     """
 
-    def __init__(self, map_names, num_envs: int, randomize: bool = True, wrapper_kwargs=None, **param_overrides):
+    def __init__(self, map_names, num_envs: int, randomize: bool = True, wrapper_kwargs=None, race=None,
+                 **param_overrides):
+        """``race``: None for phase 1, else RaceWrapper kwargs (two-car env, phase 2)."""
         import jax  # noqa: F401  (keep module import light for the CLI)
 
         from f1tenth_gym_jax.envs import F110Env
@@ -394,11 +396,21 @@ class MultiMapEnv:
         self.num_envs = num_envs
         self.envs_per_map = num_envs // len(self.map_names)
         self.randomize = randomize
-        self.wrappers = [
-            Phase1Wrapper(F110Env(1, make_param(m, randomize=randomize, **param_overrides)), randomize,
-                          **(wrapper_kwargs or {}))
-            for m in self.map_names
-        ]
+        self.race = race is not None
+        if self.race:
+            from .race import RaceWrapper
+
+            self.wrappers = [
+                RaceWrapper(F110Env(2, make_param(m, randomize=randomize, scan_other_agents=True, **param_overrides)),
+                            randomize, **race, **(wrapper_kwargs or {}))
+                for m in self.map_names
+            ]
+        else:
+            self.wrappers = [
+                Phase1Wrapper(F110Env(1, make_param(m, randomize=randomize, **param_overrides)), randomize,
+                              **(wrapper_kwargs or {}))
+                for m in self.map_names
+            ]
         self.obs_dim = self.wrappers[0].obs_dim
         self.action_dim = self.wrappers[0].action_dim
         import jax.numpy as jnp
@@ -417,7 +429,8 @@ class MultiMapEnv:
             states.append(s)
         return jnp.concatenate(obs), tuple(states)
 
-    def step(self, key, states, actions):
+    def step(self, key, states, actions, opp_params=None):
+        """``opp_params``: race only, the snapshot-opponent pool (same for every env)."""
         import jax
         import jax.numpy as jnp
 
@@ -426,7 +439,10 @@ class MultiMapEnv:
         outs = []
         for i, (w, k, s) in enumerate(zip(self.wrappers, keys, states)):
             a = actions[i * n : (i + 1) * n]
-            outs.append(jax.vmap(w.step)(jax.random.split(k, n), s, a))
+            if self.race:
+                outs.append(jax.vmap(w.step, in_axes=(0, 0, 0, None))(jax.random.split(k, n), s, a, opp_params))
+            else:
+                outs.append(jax.vmap(w.step)(jax.random.split(k, n), s, a))
         obs = jnp.concatenate([o[0] for o in outs])
         new_states = tuple(o[1] for o in outs)
         reward = jnp.concatenate([o[2] for o in outs])

@@ -102,6 +102,8 @@ def step_reward(progress_m, track_length, action, prev_action, collided):
 class Phase1Wrapper:
     """Single-agent, array-in/array-out wrapper; auto-resets on done."""
 
+    NUM_AGENTS = 1  # rl.race.RaceWrapper: 2 (ego is agent 0)
+
     def __init__(
         self,
         env: F110Env,
@@ -115,8 +117,8 @@ class Phase1Wrapper:
         max_delay: int = cp.MAX_DELAY_STEPS,
     ):
         p = env.params
-        if env.num_agents != 1:
-            raise ValueError("Phase1Wrapper is single-agent.")
+        if env.num_agents != self.NUM_AGENTS:
+            raise ValueError(f"{type(self).__name__} needs an env with {self.NUM_AGENTS} agent(s).")
         if (p.longitudinal_action_type, p.steering_action_type) != ("velocity", "steeringangle"):
             raise ValueError("Phase 1 uses velocity+steeringangle control.")
         if not p.produce_scans or abs(p.fov - ob.FOV) > 1e-9:

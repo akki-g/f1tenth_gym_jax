@@ -140,3 +140,83 @@ def test_deeper_mlp_exports_and_matches(tmp_path):
     for policy in (NumpyPolicy(out), _load_car_policy_module().NumpyPolicy(out)):
         assert len(policy.layers) == 4
         assert np.max(np.abs(policy(obs) - ref)) < 1e-5
+
+
+def test_gru_export_sequence_parity(tmp_path):
+    """NumPy cnn_gru step matches the JAX actor's tanh(mean) within 1e-5 over
+    1,000 steps that include 3 resets (spec: sequence parity), in both copies."""
+    from jax.experimental import enable_x64
+
+    from rl import maps as M
+    from rl.export_policy import export
+    from rl.networks import CnnGru, deterministic_action
+    from rl.numpy_policy import NumpyPolicy
+    from rl.train_ppo import Config, make_trainer, save_checkpoint
+
+    M.use_map_dir(M.DEFAULT_MAP_DIR)
+    cfg = Config(arch="cnn_gru", frame_stack=1, num_envs=4, num_steps=32, seq_len=16, num_minibatches=2,
+                 total_timesteps=4 * 32 * 2, train_maps=("Duct1002", "Duct1003"), heldout_maps=("Duct1077",))
+    env = M.MultiMapEnv(cfg.train_maps, cfg.num_envs, wrapper_kwargs=cfg.wrapper_kwargs(), num_beams=cfg.num_beams)
+    init, update, *_ = make_trainer(cfg, env)
+    r, *_ = update(jax.jit(init)(jax.random.PRNGKey(0)))
+    p = r.actor.params  # non-trivial head so the comparison means something
+    p["params"]["actor_out"]["kernel"] = jax.random.normal(jax.random.PRNGKey(7), p["params"]["actor_out"]["kernel"].shape)
+    r = r._replace(actor=r.actor.replace(params=p))
+    ckpt = tmp_path / "gru.safetensors"
+    save_checkpoint(ckpt, r, cfg)
+    out = tmp_path / "gru.npz"
+    config = export(ckpt, out)
+    assert config["arch"] == "cnn_gru" and config["obs_dim"] == ob.OBS_DIM and config["frame_stack"] == 1
+    assert config["beam_indices"] == list(range(0, 1081, 4)) and config["scan_padding"] == "edge"
+
+    rng = np.random.default_rng(0)
+    T = 1000
+    obs = np.concatenate([rng.uniform(0, 1, (T, ob.NUM_BEAMS)), rng.uniform(0, 1, (T, 1)),
+                          rng.uniform(-1, 1, (T, 2))], axis=1).astype(np.float32)
+    resets = {0, 250, 500, 750}
+    model = CnnGru()
+    with enable_x64():
+        p64 = jax.tree.map(lambda x: jnp.asarray(x, jnp.float64), r.actor.params)
+        n = r.normalizer
+        n64 = type(n)(*(jnp.asarray(v, jnp.float64) for v in (n.mean, n.var, n.count)))
+        step = jax.jit(lambda h, o: model.apply(p64, h, n64(o)))
+        h = jnp.zeros((1, 128), jnp.float64)
+        ref = []
+        for t in range(T):
+            if t in resets:
+                h = jnp.zeros_like(h)
+            h, mean, _, _ = step(h, jnp.asarray(obs[t : t + 1], jnp.float64))
+            ref.append(np.asarray(deterministic_action(mean))[0])
+    ref = np.array(ref)
+    assert np.abs(ref).max() > 0.3
+    for policy in (NumpyPolicy(out), _load_car_policy_module().NumpyPolicy(out)):
+        got = []
+        for t in range(T):
+            if t in resets:
+                policy.reset()
+            got.append(policy(obs[t]))
+        assert np.max(np.abs(np.array(got) - ref)) < 1e-5
+    # without the resets the trajectory differs: the state really is carried
+    pol = NumpyPolicy(out)
+    no_reset = np.array([pol(obs[t]) for t in range(T)])
+    assert np.abs(no_reset[250:260] - ref[250:260]).max() > 1e-4
+
+
+def test_phase1_npz_unchanged_through_mlp_path():
+    """The phase-1 policy.npz (no arch field) runs through the MLP path exactly as before."""
+    path = ROBORACER / "src" / "rl_policy" / "models" / "policy.npz"
+    if not path.exists():
+        pytest.skip(f"{path} not found")
+    from rl.numpy_policy import NumpyPolicy
+
+    pol = NumpyPolicy(path)
+    assert pol.arch == "mlp" and pol.obs_dim == 330
+    with np.load(path, allow_pickle=False) as d:
+        W = [(d[f"W{i}"].astype(np.float64), d[f"b{i}"].astype(np.float64)) for i in range(3)]
+        mean, std = d["obs_mean"].astype(np.float64), d["obs_std"].astype(np.float64)
+    x = np.random.default_rng(1).uniform(0, 1, (50, 330))
+    z = np.clip((x - mean) / std, -10, 10)
+    z = np.tanh(z @ W[0][0] + W[0][1])
+    z = np.tanh(z @ W[1][0] + W[1][1])
+    np.testing.assert_allclose(pol(x), np.tanh(z @ W[2][0] + W[2][1]), atol=1e-12)
+    pol.reset()  # a no-op for an MLP

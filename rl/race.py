@@ -131,7 +131,10 @@ class RaceWrapper(Phase1Wrapper):
     NUM_AGENTS = 2
 
     def __init__(self, env: F110Env, randomize: bool = True, opponents: bool = True, gru_dim: int = 128,
-                 snapshot_model=None, **kwargs):
+                 snapshot_model=None, fixed_opponent=None, fixed_speed_scale=None, fixed_side_by_side=None,
+                 **kwargs):
+        """``fixed_*`` (evaluation): use this opponent type (OPP_*), speed factor and
+        start mode in every episode instead of drawing them."""
         super().__init__(env, randomize, **kwargs)
         if not env.params.scan_other_agents:
             raise ValueError("the race env must cast scans against the other car (scan_other_agents=True)")
@@ -140,6 +143,9 @@ class RaceWrapper(Phase1Wrapper):
         self.opponents = opponents
         self.gru_dim = gru_dim
         self.snapshot_model = snapshot_model  # networks.CnnGru (race format) for snapshot opponents
+        self.fixed_opponent = fixed_opponent
+        self.fixed_speed_scale = fixed_speed_scale
+        self.fixed_side_by_side = fixed_side_by_side
         self.obs_dim = ob.obs_dim(1, self.num_beams) + PRIV_DIM
 
     # ------------------------------------------------------------ helpers
@@ -210,6 +216,8 @@ class RaceWrapper(Phase1Wrapper):
         L = self.track_length
         s0 = jax.random.uniform(k_s) * L
         side_by_side = jax.random.bernoulli(k_mode, 0.5)
+        if self.fixed_side_by_side is not None:
+            side_by_side = jnp.array(bool(self.fixed_side_by_side))
         sign = jnp.where(jax.random.bernoulli(k_side, 0.5), 1.0, -1.0)
         q = self.local_half_width(s0) / 2  # a quarter of the local width
         gap = jax.random.uniform(k_gap, minval=STAGGER_M[0], maxval=STAGGER_M[1])
@@ -233,6 +241,8 @@ class RaceWrapper(Phase1Wrapper):
         _, base = super().reset(k_base)  # ego draws and bookkeeping; both cars' vehicle params
         p = jnp.array(OPP_MIX if self.opponents else (1.0, 0.0, 0.0, 0.0))
         opp_type = jax.random.choice(k_opp, 4, p=p).astype(jnp.int32)
+        if self.fixed_opponent is not None:
+            opp_type = jnp.array(self.fixed_opponent, jnp.int32)
         es, start_gap = self._place(k_place, base.env_state, opp_type)
         es = self._env._scan(es, k_scan)
         stack = ob.init_stack(self._sense(k_noise, es), self.frame_stack, xp=jnp)
@@ -240,7 +250,8 @@ class RaceWrapper(Phase1Wrapper):
         rs = RaceState(
             ego=ego,
             opp_type=opp_type,
-            opp_speed_scale=jax.random.uniform(k_scale, minval=SPEED_SCALE[0], maxval=SPEED_SCALE[1]),
+            opp_speed_scale=(jax.random.uniform(k_scale, minval=SPEED_SCALE[0], maxval=SPEED_SCALE[1])
+                             if self.fixed_speed_scale is None else jnp.array(self.fixed_speed_scale, jnp.float32)),
             opp_snapshot=jax.random.randint(k_snap, (), 0, 1 << 20).astype(jnp.int32),
             opp_h=jnp.zeros((self.gru_dim,)),
             opp_first=jnp.array(True),

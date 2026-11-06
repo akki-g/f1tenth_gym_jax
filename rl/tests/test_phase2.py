@@ -222,3 +222,16 @@ def test_init_from_phase1c_checkpoint(race_trainer, tmp_path):
     assert float(jnp.abs(jax.tree.leaves(jax.tree.map(lambda x: x[1], pool["params"]))[0]).max()) > 0.0
     r2, *_ = update(r)  # the race update runs from the loaded state
     assert int(r2.update) == 1
+
+
+def test_race_evaluator_runs_every_setting(race_trainer):
+    from rl.race_eval import DEFAULT_SETTINGS, make_race_evaluator, snapshot_pool
+
+    cfg, init, update, internals = race_trainer
+    r = jax.jit(init)(jax.random.PRNGKey(0))
+    evaluate = make_race_evaluator(["Duct1077"], episodes=2, max_steps=30, model_cfg=cfg.model_cfg())
+    rep = evaluate(r.actor.params, r.normalizer, snapshot_pool(r.actor.params, r.normalizer))
+    assert set(rep["summary"]) == {name for name, _, _ in DEFAULT_SETTINGS}
+    starts = {(c["opponent"], c["start"]) for c in rep["cases"]}
+    assert ("follow_gap_0.9", "side_by_side") in starts and ("follow_gap_0.9", "staggered") in starts
+    assert all(0.0 <= c["win_rate"] <= 1.0 for c in rep["cases"])

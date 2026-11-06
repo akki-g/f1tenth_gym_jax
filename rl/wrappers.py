@@ -3,7 +3,8 @@ frame stack, observation and reward around the patched single-agent F110Env.
 
 Stages, innermost first, as the spec orders them:
 
-1. Action delay      executed = [a_t, a_{t-1}, a_{t-2}][k], k ~ U{0, 1, 2} per episode
+1. Action delay      executed = [a_t, ..., a_{t-K}][k], k ~ U{0, ..., max_delay} per episode
+                     (max_delay 4 in phase 1c, 2 in phase 1)
 2. Steering offset   + U(-0.02, 0.02) rad per episode on the executed steering
 3. Scan origin       inside the env: Param.scan_origin_offset (lidar - lr)
 4. LiDAR noise       N(0, 0.03 m), clip [0, 10], 1% of beams set to 10 m
@@ -54,10 +55,10 @@ from . import obs as ob
 @struct.dataclass
 class WrapperState:
     env_state: State
-    delay_buffer: chex.Array  # [MAX_DELAY_STEPS, 2] previous env commands, newest first
+    delay_buffer: chex.Array  # [max_delay, 2] previous env commands, newest first
     delay_k: chex.Array  # int, this episode's delay in policy steps
     steer_offset: chex.Array  # rad, this episode's steering offset
-    stack: chex.Array  # [FRAME_STACK, NUM_BEAMS] normalized scans, newest first
+    stack: chex.Array  # [frame_stack, num_beams] normalized scans, newest first
     prev_action: chex.Array  # [2] previous policy action (a_v, a_s)
     ep_return: chex.Array
     ep_length: chex.Array
@@ -110,14 +111,19 @@ class Phase1Wrapper:
         wall_margin_noise: float = cp.WALL_MARGIN_NOISE,
         wrong_way_steps: int = cp.WRONG_WAY_STEPS,
         stall_steps: int = cp.STALL_STEPS,
+        frame_stack: int = ob.FRAME_STACK,
+        max_delay: int = cp.MAX_DELAY_STEPS,
     ):
         p = env.params
         if env.num_agents != 1:
             raise ValueError("Phase1Wrapper is single-agent.")
         if (p.longitudinal_action_type, p.steering_action_type) != ("velocity", "steeringangle"):
             raise ValueError("Phase 1 uses velocity+steeringangle control.")
-        if not p.produce_scans or p.num_beams != ob.NUM_BEAMS:
-            raise ValueError(f"Env must produce {ob.NUM_BEAMS}-beam scans.")
+        if not p.produce_scans or abs(p.fov - ob.FOV) > 1e-9:
+            raise ValueError(f"Env must produce scans over {ob.FOV} rad.")
+        ob.beam_stride(p.num_beams)  # raises unless the beams land on the car's grid
+        if frame_stack < 1 or max_delay < 0:
+            raise ValueError("need frame_stack >= 1 and max_delay >= 0")
         if randomize != (p.dyn_param_sampler is not None):
             raise ValueError("randomize must match whether the env samples vehicle params.")
         if p.max_num_laps <= max_laps:
@@ -145,7 +151,10 @@ class Phase1Wrapper:
             raise ValueError("map smaller than the wall-buffer window")
         self._wall_px = jnp.asarray(occ)
         self.track_length = env.track_length
-        self.obs_dim = ob.OBS_DIM
+        self.num_beams = int(p.num_beams)
+        self.frame_stack = int(frame_stack)
+        self.max_delay = int(max_delay)
+        self.obs_dim = ob.obs_dim(self.frame_stack, self.num_beams)
         self.action_dim = 2
 
     @property
@@ -158,7 +167,7 @@ class Phase1Wrapper:
         if not self.randomize:
             return jnp.array(0, dtype=jnp.int32), jnp.array(0.0), jnp.array(self.wall_margin, jnp.float32)
         k_delay, k_off, k_margin = jax.random.split(key, 3)
-        k = jax.random.randint(k_delay, (), 0, cp.MAX_DELAY_STEPS + 1)
+        k = jax.random.randint(k_delay, (), 0, self.max_delay + 1)
         off = jax.random.uniform(k_off, (), minval=-cp.STEER_OFFSET_MAX, maxval=cp.STEER_OFFSET_MAX)
         n = self.wall_margin_noise
         margin = self.wall_margin * jax.random.uniform(k_margin, (), minval=1.0 - n, maxval=1.0 + n)
@@ -194,11 +203,11 @@ class Phase1Wrapper:
         k_env, k_ep, k_noise = jax.random.split(key, 3)
         _, env_state = self._env.reset(k_env)
         delay_k, steer_offset, margin = self._episode_draws(k_ep)
-        stack = ob.init_stack(self._sense(k_noise, env_state), xp=jnp)
+        stack = ob.init_stack(self._sense(k_noise, env_state), self.frame_stack, xp=jnp)
         prev_action = ob.reset_action(xp=jnp)
         state = WrapperState(
             env_state=env_state,
-            delay_buffer=jnp.zeros((cp.MAX_DELAY_STEPS, 2)),
+            delay_buffer=jnp.zeros((self.max_delay, 2)),
             delay_k=delay_k,
             steer_offset=steer_offset,
             stack=stack,
@@ -231,7 +240,7 @@ class Phase1Wrapper:
             prev_winding_vector=x[:, :2] - env.winding_point,
         )
         es = env._scan(es, k_scan)
-        stack = ob.init_stack(self._sense(k_noise, es), xp=jnp)
+        stack = ob.init_stack(self._sense(k_noise, es), self.frame_stack, xp=jnp)
         state = state.replace(env_state=es, stack=stack)
         return ob.build_obs(stack, x[0, 3], state.prev_action, xp=jnp), state
 

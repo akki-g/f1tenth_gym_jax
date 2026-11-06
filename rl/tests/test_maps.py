@@ -10,6 +10,7 @@ from PIL import Image
 from scipy.ndimage import distance_transform_edt as edt
 
 from rl import maps as M
+from rl import obs as ob
 
 ALL_GEN = M.TRAIN_GEN_SEEDS + M.HELDOUT_GEN_SEEDS
 
@@ -135,11 +136,11 @@ def test_multimap_env_shapes(prepared):
     env = M.MultiMapEnv(M.TRAIN_MAPS, num_envs=32, randomize=True)
     assert env.envs_per_map == 2
     obs, states = jax.jit(env.reset)(jax.random.PRNGKey(0))
-    assert obs.shape == (32, 330)
+    assert obs.shape == (32, ob.OBS_DIM)
     step = jax.jit(env.step)
     a = jnp.tile(jnp.array([-0.5, 0.0]), (32, 1))
     obs, states, r, d, info = step(jax.random.PRNGKey(1), states, a)
-    assert obs.shape == (32, 330) and r.shape == (32,) and d.shape == (32,)
+    assert obs.shape == (32, ob.OBS_DIM) and r.shape == (32,) and d.shape == (32,)
     np.testing.assert_array_equal(np.asarray(info["map_id"]), np.repeat(np.arange(16), 2))
     with pytest.raises(ValueError):
         M.MultiMapEnv(M.TRAIN_MAPS, num_envs=30)

@@ -50,9 +50,9 @@ WHEELBASE = 0.33  # m (car config vesc.yaml)
 # Sensing and timing.
 # ---------------------------------------------------------------------------
 LIDAR_FOV = 4.7124  # rad, 270 deg (Hokuyo UST-10LX)
-NUM_BEAMS = 109  # policy beams, 2.5 deg apart
+NUM_BEAMS = 271  # policy beams, 1.0 deg apart (phase 1c; phase 1: 109, 2.5 deg)
 CAR_SCAN_BEAMS = 1081  # beams in the car's full scan
-BEAM_STRIDE = 10  # car beams used: indices 0, 10, ..., 1080
+BEAM_STRIDE = 4  # car beams used: indices 0, 4, ..., 1080
 MAX_RANGE = 10.0  # m; clip and normalize to [0, 1]
 RANGE_NOISE_STD = 0.03  # m, Gaussian (spec repeatability)
 DROPOUT_PROB = 0.01  # fraction of beams set to max range (estimate)
@@ -61,15 +61,17 @@ TIMESTEP = 0.01  # s, physics step (gym)
 TIMESTEP_RATIO = 4  # physics steps per policy step -> 25 Hz
 POLICY_DT = TIMESTEP * TIMESTEP_RATIO
 POLICY_RATE_HZ = 1.0 / POLICY_DT
-MAX_DELAY_STEPS = 2  # action delay 0..2 policy steps (0-80 ms), uniform per episode
+MAX_DELAY_STEPS = 4  # action delay 0..4 policy steps (0-160 ms), uniform per episode (phase 1: 0..2)
 STEER_OFFSET_MAX = 0.02  # rad, uniform +- per episode
 
 # ---------------------------------------------------------------------------
 # Action, observation and episode (spec sections 4.4-4.6).
 # ---------------------------------------------------------------------------
 V_CMD_MAX = 8.0  # m/s; policy speed command range [0, V_CMD_MAX]
-FRAME_STACK = 3
-OBS_DIM = FRAME_STACK * NUM_BEAMS + 1 + 2  # 330
+FRAME_STACK = 1  # CNN+GRU; the MLP baselines use 3 and 8
+OBS_DIM = FRAME_STACK * NUM_BEAMS + 1 + 2  # 274
+# Phase-1 checkpoints carry no layout fields in their config; they used this.
+LEGACY_LAYOUT = {"arch": "mlp", "num_beams": 109, "frame_stack": 3, "max_delay": 2}
 EPISODE_SECONDS = 90.0
 MAX_STEPS = int(round(EPISODE_SECONDS / POLICY_DT))  # 2250
 MAX_LAPS = 2

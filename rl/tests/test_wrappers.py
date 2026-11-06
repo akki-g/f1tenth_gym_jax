@@ -32,7 +32,7 @@ def test_randomization_varies_per_env(train_env):
         assert vals.min() >= lo - 1e-6 and vals.max() <= hi + 1e-6
         assert len(np.unique(vals)) >= 0.8 * N_ENVS
     k = np.asarray(ws.delay_k)
-    assert set(k.tolist()) == {0, 1, 2}
+    assert set(k.tolist()) == set(range(cp.MAX_DELAY_STEPS + 1)) == {0, 1, 2, 3, 4}
     off = np.asarray(ws.steer_offset)
     assert np.all(np.abs(off) <= cp.STEER_OFFSET_MAX) and len(np.unique(off)) == N_ENVS
 
@@ -125,10 +125,11 @@ def test_scan_offset(test_map_dir):
     assert abs(r0 - (wall_x - 1.237)) < 0.01
 
 
-def test_observation_shape_and_range(train_env):
-    """Shape (330,), scan values in [0, 1], stacked frames update in order."""
+def test_observation_shape_and_range():
+    """Stack of 3 (MLP-3): shape (816,), scan values in [0, 1], stacked frames update in order."""
+    train_env = Phase1Wrapper(F110Env(1, make_param("Spielberg", randomize=True)), randomize=True, frame_stack=3)
     obs, ws = train_env.reset(jax.random.PRNGKey(7))
-    assert obs.shape == (ob.OBS_DIM,) == (330,)
+    assert obs.shape == (ob.obs_dim(3),) == (816,)
     nb = ob.NUM_BEAMS
     frames = np.asarray(obs[: 3 * nb]).reshape(3, nb)
     np.testing.assert_array_equal(frames[0], frames[1])  # reset fills the stack
@@ -142,7 +143,7 @@ def test_observation_shape_and_range(train_env):
         obs, ws, _, done, _ = train_env.step(k, ws, a)
         assert not bool(done)
         o = np.asarray(obs)
-        assert o.shape == (330,)
+        assert o.shape == (816,)
         frames = o[: 3 * nb].reshape(3, nb)
         assert frames.min() >= 0.0 and frames.max() <= 1.0
         np.testing.assert_array_equal(frames[1], prev[0])  # previous newest moved back

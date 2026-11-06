@@ -37,8 +37,12 @@ def make_evaluator(
     randomize: bool = False,
     seed: int = 12345,
     hidden_dim: int = 256,
+    wrapper_kwargs=None,
 ):
-    """Returns evaluate(actor_params, normalizer) -> report dict."""
+    """Returns evaluate(actor_params, normalizer) -> report dict.
+
+    ``wrapper_kwargs`` (wall margin, wrong-way and stall checks) default to
+    car_params; nominal evaluation uses the margin without noise."""
     from f1tenth_gym_jax.envs import F110Env
 
     from .domain_rand import make_param
@@ -50,6 +54,7 @@ def make_evaluator(
             F110Env(1, make_param(m, randomize=randomize, max_steps=max_steps)),
             randomize,
             max_laps=1,
+            **(wrapper_kwargs or {}),
         )
         for m in map_names
     ]
@@ -69,6 +74,8 @@ def make_evaluator(
             lap=jnp.zeros(n, bool),
             collision=jnp.zeros(n, bool),
             timeout=jnp.zeros(n, bool),
+            wrong_way=jnp.zeros(n, bool),
+            stall=jnp.zeros(n, bool),
             length=zeros,
             speed=zeros,
             progress=zeros,
@@ -96,13 +103,16 @@ def make_evaluator(
                 lap=record(c["lap"], info["lap_complete"]),
                 collision=record(c["collision"], info["collision"]),
                 timeout=record(c["timeout"], info["timeout"]),
+                wrong_way=record(c["wrong_way"], info["wrong_way"]),
+                stall=record(c["stall"], info["stall"]),
                 length=record(c["length"], info["episode_length"].astype(jnp.float32)),
                 speed=record(c["speed"], info["episode_mean_speed"]),
                 progress=record(c["progress"], info["episode_progress"]),
             )
 
         out = jax.lax.while_loop(cond, body, init)
-        return {k: out[k] for k in ("finished", "lap", "collision", "timeout", "length", "speed", "progress")}
+        return {k: out[k] for k in ("finished", "lap", "collision", "timeout", "wrong_way", "stall",
+                                    "length", "speed", "progress")}
 
     @jax.jit
     def run_all(actor_params, normalizer):
@@ -121,6 +131,8 @@ def make_evaluator(
                 "completion_rate": float(complete.mean()),
                 "collision_rate": float(r["collision"].mean()),
                 "timeout_rate": float(r["timeout"].mean()),
+                "wrong_way_rate": float(r["wrong_way"].mean()),
+                "stall_rate": float(r["stall"].mean()),
                 "lap_time_mean": float(lap_times.mean()) if len(lap_times) else None,
                 "lap_time_min": float(lap_times.min()) if len(lap_times) else None,
                 "mean_speed": float(r["speed"].mean()),
@@ -148,6 +160,14 @@ def make_evaluator(
     return evaluate
 
 
+WRAPPER_KEYS = ("wall_margin", "wall_margin_noise", "wrong_way_steps", "stall_steps")
+
+
+def wrapper_kwargs_from(config: dict) -> dict:
+    """The checkpoint's episode-end settings; older checkpoints get car_params' defaults."""
+    return {k: config[k] for k in WRAPPER_KEYS if k in config}
+
+
 def main(argv=None):
     from .train_ppo import load_checkpoint
 
@@ -164,7 +184,8 @@ def main(argv=None):
     M.use_map_dir(args.map_dir)
     ckpt = load_checkpoint(args.checkpoint)
     evaluate = make_evaluator(args.maps, args.episodes, args.max_steps, args.randomize,
-                              hidden_dim=ckpt["config"]["hidden_dim"])
+                              hidden_dim=ckpt["config"]["hidden_dim"],
+                              wrapper_kwargs=wrapper_kwargs_from(ckpt["config"]))
     report = evaluate(ckpt["actor_params"], ckpt["normalizer"])
     report["checkpoint"] = str(args.checkpoint)
     report["checkpoint_sha256"] = ckpt["sha256"]

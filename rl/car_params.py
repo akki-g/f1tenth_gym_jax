@@ -77,6 +77,19 @@ PROGRESS_SCALE = 10.0  # reward per lap of progress
 SMOOTHNESS_COEF = 0.01  # penalty on |a_t - a_{t-1}|_1
 COLLISION_PENALTY = 1.0
 
+# Episode ends added after the first Newton run (results note, D22). Each one
+# ends the episode with COLLISION_PENALTY; none changes what the car runs.
+# Wall buffer: the collision box is inflated by this much per side. The race
+# walls are round air ducts and the LiDAR scans one plane, so it sees them a
+# few cm further away than their widest point; bumpers stick out too.
+WALL_MARGIN = 0.05  # m per side (2 in)
+WALL_MARGIN_NOISE = 0.30  # randomized episodes: WALL_MARGIN * U(0.7, 1.3)
+# Wrong way: heading more than 90 deg off the track direction for ~0.5 s.
+WRONG_WAY_STEPS = 13
+# Stall: below STALL_SPEED for 2 s (e.g. pinned or stopped against a wall).
+STALL_SPEED = 0.2  # m/s
+STALL_STEPS = 50
+
 
 def scan_origin_offset(ref_from_rear_axle: float) -> float:
     """Forward shift of the scan origin from the dynamics reference point.

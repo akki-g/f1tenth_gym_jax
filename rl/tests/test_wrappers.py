@@ -186,3 +186,108 @@ def test_laps_counted_from_progress(train_env):
     _, ws3, _, done, info = train_env.step(jax.random.PRNGKey(13), ws.replace(ep_progress=jnp.array(0.5, jnp.float32)), jnp.array([-0.3, 0.0]))
     assert not bool(done) and not bool(info["lap_complete"])
     assert train_env.env.params.max_num_laps > 1000  # env's winding counter is off
+
+
+# ---------------------------------------------------------------- episode ends
+def _fine_env(**kw):
+    return Phase1Wrapper(F110Env(1, make_param("FineBox", randomize=False)), randomize=False, **kw)
+
+
+def _place(ws, x, y, yaw, v=0.0):
+    cs = ws.env_state.cartesian_states.at[0].set(jnp.array([x, y, 0.0, v, yaw, 0.0, 0.0]))
+    return ws.replace(env_state=ws.env_state.replace(cartesian_states=cs, last_cartesian_states=cs))
+
+
+def test_wall_buffer_hit_at_known_gaps(test_map_dir):
+    """Facing the +x wall: the buffer fires when the gap is under the margin, the env's own check does not."""
+    env = _fine_env()
+    _, ws = env.reset(jax.random.PRNGKey(0))
+    wall_x = FINE_HALF - FINE_WALL
+    half_len = env.env.params.length / 2
+    for gap, margin, expect in ((0.03, 0.05, True), (0.08, 0.05, False), (0.03, 0.0, False), (0.06, 0.065, True)):
+        st = _place(ws, wall_x - half_len - gap, 0.0, 0.0).env_state
+        assert bool(env.wall_buffer_hit(st, jnp.array(margin))) == expect, (gap, margin)
+
+
+def test_wall_margin_randomized_per_episode(train_env):
+    _, ws = jax.vmap(train_env.reset)(jax.random.split(jax.random.PRNGKey(3), N_ENVS))
+    m = np.asarray(ws.margin)
+    lo, hi = cp.WALL_MARGIN * (1 - cp.WALL_MARGIN_NOISE), cp.WALL_MARGIN * (1 + cp.WALL_MARGIN_NOISE)
+    assert m.min() >= lo - 1e-7 and m.max() <= hi + 1e-7
+    assert m.std() > 0.004 and abs(m.mean() - cp.WALL_MARGIN) < 0.004
+    _, ws_nom = _fine_env().reset(jax.random.PRNGKey(3))
+    assert abs(float(ws_nom.margin) - cp.WALL_MARGIN) < 1e-7  # nominal: no noise
+
+
+def test_wall_buffer_ends_episode_with_penalty(test_map_dir):
+    env = _fine_env()
+    _, ws = env.reset(jax.random.PRNGKey(0))
+    ws = _place(ws, FINE_HALF - FINE_WALL - env.env.params.length / 2 - 0.03, 0.0, 0.0)
+    _, _, reward, done, info = env.step(jax.random.PRNGKey(1), ws, jnp.array([-1.0, 0.0]))
+    assert bool(done) and bool(info["collision"]) and bool(info["wall_buffer"]) and not bool(info["contact"])
+    assert float(reward) < -0.9
+
+
+def test_wrong_way_ends_episode(test_map_dir):
+    """Turned around on the centerline (FineBox's track runs CCW): done after WRONG_WAY_STEPS, not before."""
+    env = _fine_env(stall_steps=0)
+    _, ws = env.reset_at(jax.random.PRNGKey(0), jnp.array(0.0))
+    x, y, yaw = (float(v) for v in ws.env_state.cartesian_states[0, jnp.array([0, 1, 4])])
+    ws = _place(ws, x, y, yaw + np.pi)
+    stop = jnp.array([-1.0, 0.0])
+    for t in range(1, cp.WRONG_WAY_STEPS + 1):
+        _, ws, reward, done, info = env.step(jax.random.PRNGKey(t), ws, stop)
+        if t < cp.WRONG_WAY_STEPS:
+            assert not bool(done), t
+    assert bool(done) and bool(info["wrong_way"]) and not bool(info["collision"]) and float(reward) < -0.9
+    # the right way round never triggers it
+    env_ok = _fine_env(stall_steps=0)
+    _, ws = env_ok.reset_at(jax.random.PRNGKey(0), jnp.array(0.0))
+    for t in range(cp.WRONG_WAY_STEPS + 5):
+        _, ws, _, done, info = env_ok.step(jax.random.PRNGKey(t), ws, stop)
+        assert not bool(done)
+
+
+def test_stall_ends_episode_and_checks_can_be_off(test_map_dir):
+    env = _fine_env()
+    _, ws = env.reset_at(jax.random.PRNGKey(0), jnp.array(0.0))
+    stop = jnp.array([-1.0, 0.0])  # speed 0
+    for t in range(1, cp.STALL_STEPS + 1):
+        _, ws, reward, done, info = env.step(jax.random.PRNGKey(t), ws, stop)
+        if t < cp.STALL_STEPS:
+            assert not bool(done), t
+    assert bool(done) and bool(info["stall"]) and float(reward) < -0.9
+    off = _fine_env(stall_steps=0, wrong_way_steps=0)
+    _, ws = off.reset_at(jax.random.PRNGKey(0), jnp.array(0.0))
+    for t in range(cp.STALL_STEPS + 10):
+        _, ws, _, done, _ = off.step(jax.random.PRNGKey(t), ws, stop)
+        assert not bool(done)
+    with pytest.raises(ValueError):
+        _fine_env(wall_margin=-0.01)
+
+
+@pytest.mark.parametrize("name", ["Duct1002", "FineBox"])
+def test_wall_buffer_window_matches_full_map_check(test_map_dir, name):
+    """The windowed check equals collision_map over every wall pixel of the map."""
+    from f1tenth_gym_jax.envs.collision_models import collision_map, get_vertices
+
+    env = Phase1Wrapper(F110Env(1, make_param(name, randomize=False)), randomize=False)
+    _, ws = env.reset(jax.random.PRNGKey(0))
+    p, rng = env.env.params, np.random.default_rng(0)
+    t = env.env.track
+    hits = 0
+    for i in range(300):  # poses along and across the track, many near walls
+        s = rng.uniform(0, float(t.centerline.s[-1]))
+        x, y = t.centerline.calc_position(s)
+        yaw = t.centerline.calc_yaw(s) + rng.normal(0, 0.6)
+        x, y = x + rng.normal(0, 0.6), y + rng.normal(0, 0.6)
+        if name == "FineBox":  # its track is a circle far from the walls: sample the whole room
+            x, y = rng.uniform(-FINE_HALF + 0.1, FINE_HALF - 0.1, 2)
+        margin = jnp.array(rng.uniform(0.0, cp.WALL_MARGIN * (1 + cp.WALL_MARGIN_NOISE)))
+        st = _place(ws, float(x), float(y), float(yaw)).env_state
+        got = bool(env.wall_buffer_hit(st, margin))
+        verts = get_vertices(jnp.array([x, y, yaw]), p.length + 2 * margin, p.width + 2 * margin)
+        want = bool(collision_map(verts[None], env.env.pixel_centers)[0])
+        assert got == want, (i, x, y, yaw, float(margin))
+        hits += want
+    assert 20 < hits < 280  # both outcomes exercised

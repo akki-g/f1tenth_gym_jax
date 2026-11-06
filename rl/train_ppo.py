@@ -75,6 +75,11 @@ class Config:
     log_std_init: float = -0.5
     # env
     randomize: bool = True
+    # episode ends beyond collisions (car_params; 0 turns a check off)
+    wall_margin: float = cp.WALL_MARGIN
+    wall_margin_noise: float = cp.WALL_MARGIN_NOISE
+    wrong_way_steps: int = cp.WRONG_WAY_STEPS
+    stall_steps: int = cp.STALL_STEPS
     train_maps: tuple = M.TRAIN_MAPS
     heldout_maps: tuple = M.HELDOUT_MAPS
     # checkpoints / evaluation
@@ -90,6 +95,10 @@ class Config:
     wandb_project: str = "roboracer-rl-phase1"
     time_limit: float = 0.0  # seconds; 0 = none. Stops cleanly with a checkpoint.
     fresh: bool = False  # ignore an existing run directory with the same hash
+
+    def wrapper_kwargs(self) -> dict:
+        return {"wall_margin": self.wall_margin, "wall_margin_noise": self.wall_margin_noise,
+                "wrong_way_steps": self.wrong_way_steps, "stall_steps": self.stall_steps}
 
     @property
     def num_updates(self) -> int:
@@ -135,6 +144,7 @@ INFO_KEYS = (
     "episode_progress", "lap_complete", "collision", "timeout", "speed",
     "delay_k", "steer_offset", "param_mu", "param_m", "param_C_Sf", "param_C_Sr",
     "param_lf", "param_h", "param_I", "map_id",
+    "contact", "wall_buffer", "wrong_way", "stall", "margin",
 )
 EPISODE_FIELDS = tuple(k for k in INFO_KEYS if k not in ("returned_episode", "speed"))
 
@@ -261,6 +271,10 @@ def make_trainer(config: Config, env: M.MultiMapEnv):
                 "completion_rate": _masked_mean(info["lap_complete"], fin),
                 "collision_rate": _masked_mean(info["collision"], fin),
                 "timeout_rate": _masked_mean(info["timeout"], fin),
+                "contact_rate": _masked_mean(info["contact"], fin),
+                "wall_buffer_rate": _masked_mean(info["wall_buffer"], fin),
+                "wrong_way_rate": _masked_mean(info["wrong_way"], fin),
+                "stall_rate": _masked_mean(info["stall"], fin),
                 "episode_progress_laps": _masked_mean(info["episode_progress"], fin),
                 "mean_speed": info["speed"].mean(),
                 "mean_step_reward": traj.reward.mean(),
@@ -392,7 +406,8 @@ def train(config: Config) -> pathlib.Path:
 
     print(f"run dir: {run_dir}  ({config.num_updates} updates, backend {jax.default_backend()})", flush=True)
     t_build = time.time()
-    env = M.MultiMapEnv(config.train_maps, config.num_envs, randomize=config.randomize)
+    env = M.MultiMapEnv(config.train_maps, config.num_envs, randomize=config.randomize,
+                        wrapper_kwargs=config.wrapper_kwargs())
     init, update, _, _ = make_trainer(config, env)
     runner = jax.jit(init)(jax.random.PRNGKey(config.seed))
     latest = run_dir / "latest.safetensors"
@@ -403,6 +418,7 @@ def train(config: Config) -> pathlib.Path:
         best_score = best_info.get("best_score", -np.inf)
         print(f"resumed from {latest} at update {int(runner.update)}", flush=True)
     evaluate = make_evaluator(config.heldout_maps, config.eval_episodes, config.eval_max_steps,
+                              wrapper_kwargs=config.wrapper_kwargs(),
                               randomize=False, hidden_dim=config.hidden_dim)
 
     wandb.init(project=config.wandb_project, name=run_dir.name, id=f"{run_dir.name}", resume="allow",

@@ -10,6 +10,12 @@ Stages, innermost first, as the spec orders them:
 5. Obs and reward    obs.py (shared with the car) and
                      r = 10 * dprogress/lap - 0.01 * |a_t - a_{t-1}|_1 - 1[collision]
 
+Episode ends (each with the collision penalty): env collision; the wall
+buffer (the collision box inflated by ``wall_margin`` per side, randomized
++-30% per episode); wrong way (heading > 90 deg off the track direction for
+``wrong_way_steps``); stall (speed < STALL_SPEED for ``stall_steps``). They use
+the sim's exact pose and track position; nothing changes on the car.
+
 Laps are counted from accumulated centerline progress (``max_laps``, 2 for
 training) and end the episode here. The env's own winding-number lap
 counter is switched off (make_param sets a huge max_num_laps): on tracks
@@ -34,9 +40,11 @@ from typing import Dict, Tuple
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import struct
 
 from f1tenth_gym_jax.envs import F110Env
+from f1tenth_gym_jax.envs.collision_models import collision_map, get_vertices
 from f1tenth_gym_jax.envs.utils import State
 
 from . import car_params as cp
@@ -55,6 +63,9 @@ class WrapperState:
     ep_length: chex.Array
     ep_speed_sum: chex.Array
     ep_progress: chex.Array  # laps of progress so far
+    margin: chex.Array  # m per side, this episode's wall buffer
+    wrong_way_count: chex.Array  # consecutive steps pointing the wrong way
+    stall_count: chex.Array  # consecutive steps below STALL_SPEED
 
 
 def delay_action(buffer, k, command):
@@ -90,7 +101,16 @@ def step_reward(progress_m, track_length, action, prev_action, collided):
 class Phase1Wrapper:
     """Single-agent, array-in/array-out wrapper; auto-resets on done."""
 
-    def __init__(self, env: F110Env, randomize: bool = True, max_laps: int = cp.MAX_LAPS):
+    def __init__(
+        self,
+        env: F110Env,
+        randomize: bool = True,
+        max_laps: int = cp.MAX_LAPS,
+        wall_margin: float = cp.WALL_MARGIN,
+        wall_margin_noise: float = cp.WALL_MARGIN_NOISE,
+        wrong_way_steps: int = cp.WRONG_WAY_STEPS,
+        stall_steps: int = cp.STALL_STEPS,
+    ):
         p = env.params
         if env.num_agents != 1:
             raise ValueError("Phase1Wrapper is single-agent.")
@@ -102,9 +122,28 @@ class Phase1Wrapper:
             raise ValueError("randomize must match whether the env samples vehicle params.")
         if p.max_num_laps <= max_laps:
             raise ValueError("the env's winding lap counter must be off (max_num_laps >> max_laps)")
+        if wall_margin < 0 or not 0 <= wall_margin_noise < 1:
+            raise ValueError("need wall_margin >= 0 and 0 <= wall_margin_noise < 1")
+        if wrong_way_steps < 0 or stall_steps < 0:
+            raise ValueError("wrong_way_steps and stall_steps must be >= 0 (0 turns the check off)")
         self._env = env
         self.randomize = randomize
         self.max_laps = max_laps
+        self.wall_margin = float(wall_margin)
+        self.wall_margin_noise = float(wall_margin_noise)
+        self.wrong_way_steps = int(wrong_way_steps)
+        self.stall_steps = int(stall_steps)
+        # wall-buffer check on a window of the map around the car, sized to
+        # cover the largest inflated footprint (same test as the env's
+        # collision_map, without scanning every wall pixel of the map)
+        res = float(env.track.resolution)
+        m_max = self.wall_margin * (1.0 + self.wall_margin_noise)
+        reach = ((p.length / 2 + m_max) ** 2 + (p.width / 2 + m_max) ** 2) ** 0.5
+        self._win = 2 * (int(reach / res) + 2) + 1
+        occ = np.asarray(env.track.occ_map) == 0.0  # occupied, as in F110Env._set_pixelcenters
+        if occ.shape[0] < self._win or occ.shape[1] < self._win:
+            raise ValueError("map smaller than the wall-buffer window")
+        self._wall_px = jnp.asarray(occ)
         self.track_length = env.track_length
         self.obs_dim = ob.OBS_DIM
         self.action_dim = 2
@@ -115,12 +154,34 @@ class Phase1Wrapper:
 
     # ------------------------------------------------------------------ reset
     def _episode_draws(self, key):
+        """(delay k, steering offset, wall margin) for one episode."""
         if not self.randomize:
-            return jnp.array(0, dtype=jnp.int32), jnp.array(0.0)
-        k_delay, k_off = jax.random.split(key)
+            return jnp.array(0, dtype=jnp.int32), jnp.array(0.0), jnp.array(self.wall_margin, jnp.float32)
+        k_delay, k_off, k_margin = jax.random.split(key, 3)
         k = jax.random.randint(k_delay, (), 0, cp.MAX_DELAY_STEPS + 1)
         off = jax.random.uniform(k_off, (), minval=-cp.STEER_OFFSET_MAX, maxval=cp.STEER_OFFSET_MAX)
-        return k, off
+        n = self.wall_margin_noise
+        margin = self.wall_margin * jax.random.uniform(k_margin, (), minval=1.0 - n, maxval=1.0 + n)
+        return k, off, margin.astype(jnp.float32)
+
+    def wall_buffer_hit(self, env_state, margin):
+        """True when a wall pixel centre lies inside the collision box inflated
+        by ``margin`` per side (the env's own check uses margin 0). Same test
+        as collision_map, restricted to the pixels around the car."""
+        env, p = self._env, self._env.params
+        pose = env_state.cartesian_states[0, jnp.array([0, 1, 4])]
+        verts = get_vertices(pose, p.length + 2.0 * margin, p.width + 2.0 * margin)
+        res, ox, oy = env.track.resolution, env.track.ox, env.track.oy
+        h, w = self._wall_px.shape
+        half = self._win // 2
+        r0 = jnp.clip(jnp.floor((pose[1] - oy) / res).astype(jnp.int32) - half, 0, h - self._win)
+        c0 = jnp.clip(jnp.floor((pose[0] - ox) / res).astype(jnp.int32) - half, 0, w - self._win)
+        wall = jax.lax.dynamic_slice(self._wall_px, (r0, c0), (self._win, self._win))
+        idx = jnp.arange(self._win)
+        cy, cx = jnp.meshgrid((r0 + idx) * res + oy + res / 2, (c0 + idx) * res + ox + res / 2, indexing="ij")
+        centers = jnp.stack([cx, cy], axis=-1).reshape(-1, 2)
+        centers = jnp.where(wall.reshape(-1, 1), centers, 1e9)  # free pixels can never be inside
+        return collision_map(verts[None], centers)[0]
 
     def _sense(self, key, env_state):
         ranges = env_state.scans[0]
@@ -132,7 +193,7 @@ class Phase1Wrapper:
     def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, WrapperState]:
         k_env, k_ep, k_noise = jax.random.split(key, 3)
         _, env_state = self._env.reset(k_env)
-        delay_k, steer_offset = self._episode_draws(k_ep)
+        delay_k, steer_offset, margin = self._episode_draws(k_ep)
         stack = ob.init_stack(self._sense(k_noise, env_state), xp=jnp)
         prev_action = ob.reset_action(xp=jnp)
         state = WrapperState(
@@ -146,6 +207,9 @@ class Phase1Wrapper:
             ep_length=jnp.zeros((), jnp.int32),
             ep_speed_sum=jnp.zeros((), jnp.float32),
             ep_progress=jnp.zeros((), jnp.float32),
+            margin=margin,
+            wrong_way_count=jnp.zeros((), jnp.int32),
+            stall_count=jnp.zeros((), jnp.int32),
         )
         speed = env_state.cartesian_states[0, 3]
         return ob.build_obs(stack, speed, prev_action, xp=jnp), state
@@ -194,16 +258,26 @@ class Phase1Wrapper:
         stack = ob.push_scan(state.stack, self._sense(k_noise, env_state), xp=jnp)
         speed = env_state.cartesian_states[0, 3]
         obs = ob.build_obs(stack, speed, action, xp=jnp)
-        collided = env_state.collisions[0]
+        contact = env_state.collisions[0]
+        buffer_hit = self.wall_buffer_hit(env_state, state.margin)
+        collided = contact | buffer_hit
+        # wrong way: heading error (wrapped to [-pi, pi]) beyond 90 deg
+        wrong_way_count = jnp.where(
+            jnp.cos(env_state.frenet_states[0, 2]) < 0.0, state.wrong_way_count + 1, 0
+        ).astype(jnp.int32)
+        wrong_way = (self.wrong_way_steps > 0) & (wrong_way_count >= self.wrong_way_steps)
+        stall_count = jnp.where(speed < cp.STALL_SPEED, state.stall_count + 1, 0).astype(jnp.int32)
+        stall = (self.stall_steps > 0) & (stall_count >= self.stall_steps)
+        failed = collided | wrong_way | stall
         progress_m = rewards["agent_0"]
-        reward = step_reward(progress_m, self.track_length, action, state.prev_action, collided)
+        reward = step_reward(progress_m, self.track_length, action, state.prev_action, failed)
 
         ep_return = state.ep_return + reward
         ep_length = state.ep_length + 1
         ep_speed_sum = state.ep_speed_sum + speed
         ep_progress = state.ep_progress + progress_m / self.track_length
         lap_complete = ep_progress >= self.max_laps
-        done = dones["__all__"] | lap_complete
+        done = dones["__all__"] | lap_complete | failed
         cont = state.replace(
             env_state=env_state,
             delay_buffer=delay_buffer,
@@ -213,6 +287,8 @@ class Phase1Wrapper:
             ep_length=ep_length,
             ep_speed_sum=ep_speed_sum,
             ep_progress=ep_progress,
+            wrong_way_count=wrong_way_count,
+            stall_count=stall_count,
         )
 
         dp = env_state.dyn_params
@@ -224,7 +300,12 @@ class Phase1Wrapper:
             "episode_mean_speed": ep_speed_sum / ep_length,
             "episode_progress": ep_progress,
             "lap_complete": lap_complete,
-            "collision": collided,
+            "collision": collided,  # wall contact or inside the wall buffer
+            "contact": contact,  # the env's own collision (no buffer)
+            "wall_buffer": buffer_hit & ~contact,
+            "wrong_way": wrong_way,
+            "stall": stall,
+            "margin": state.margin,
             "timeout": env_state.step >= self._env.params.max_steps,
             "speed": speed,
             "delay_k": state.delay_k,

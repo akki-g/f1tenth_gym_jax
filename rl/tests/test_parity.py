@@ -81,7 +81,9 @@ def test_parity_with_classic_gym(test_map_dir):
 
     # JAX: phase-1 env, nominal, through the wrapper
     p = make_param("OpenBox", randomize=False, max_steps=10_000, max_num_laps=100)
-    w = Phase1Wrapper(F110Env(1, p), randomize=False)
+    # dynamics only: the sequence turns freely and starts slowly, so the
+    # wrong-way, stall and wall-buffer episode ends (tested separately) are off
+    w = Phase1Wrapper(F110Env(1, p), randomize=False, wall_margin=0.0, wrong_way_steps=0, stall_steps=0)
     _, ws = w.reset_at(jax.random.PRNGKey(0), 0.0)
     start = np.asarray(ws.env_state.cartesian_states[0, [0, 1, 4]], dtype=np.float64)
     step = jax.jit(w.step)

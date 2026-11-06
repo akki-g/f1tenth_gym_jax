@@ -67,7 +67,7 @@ def _update_of(path: pathlib.Path) -> int:
 
 
 def run(checkpoints, settings, episodes, max_steps, out_dir: pathlib.Path) -> dict:
-    from .evaluate import make_evaluator
+    from .evaluate import make_evaluator, wrapper_kwargs_from
     from .train_ppo import load_checkpoint
 
     loaded = [(p, load_checkpoint(p)) for p in checkpoints]
@@ -81,7 +81,7 @@ def run(checkpoints, settings, episodes, max_steps, out_dir: pathlib.Path) -> di
     for setting in settings:
         t0 = time.time()
         evaluate = make_evaluator(map_names, episodes, max_steps, randomize=(setting == "randomized"),
-                                  hidden_dim=hidden_dim)
+                                  hidden_dim=hidden_dim, wrapper_kwargs=wrapper_kwargs_from(loaded[-1][1]["config"]))
         print(f"[{setting}] evaluator built in {time.time() - t0:.0f}s", flush=True)
         for path, ck in loaded:
             rep = evaluate(ck["actor_params"], ck["normalizer"])

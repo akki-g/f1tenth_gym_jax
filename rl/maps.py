@@ -380,7 +380,7 @@ class MultiMapEnv:
     over maps unrolls inside jit.
     """
 
-    def __init__(self, map_names, num_envs: int, randomize: bool = True, **param_overrides):
+    def __init__(self, map_names, num_envs: int, randomize: bool = True, wrapper_kwargs=None, **param_overrides):
         import jax  # noqa: F401  (keep module import light for the CLI)
 
         from f1tenth_gym_jax.envs import F110Env
@@ -395,7 +395,8 @@ class MultiMapEnv:
         self.envs_per_map = num_envs // len(self.map_names)
         self.randomize = randomize
         self.wrappers = [
-            Phase1Wrapper(F110Env(1, make_param(m, randomize=randomize, **param_overrides)), randomize)
+            Phase1Wrapper(F110Env(1, make_param(m, randomize=randomize, **param_overrides)), randomize,
+                          **(wrapper_kwargs or {}))
             for m in self.map_names
         ]
         self.obs_dim = self.wrappers[0].obs_dim

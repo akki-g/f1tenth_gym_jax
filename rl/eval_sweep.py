@@ -71,17 +71,19 @@ def run(checkpoints, settings, episodes, max_steps, out_dir: pathlib.Path) -> di
     from .train_ppo import load_checkpoint
 
     loaded = [(p, load_checkpoint(p)) for p in checkpoints]
-    hidden = {ck["config"]["hidden_dim"] for _, ck in loaded}
-    if len(hidden) != 1:
-        raise ValueError(f"checkpoints disagree on hidden_dim: {hidden}")
-    (hidden_dim,) = hidden
+    from .networks import model_cfg_from
+
+    cfgs = {json.dumps(model_cfg_from(ck["config"]), sort_keys=True) for _, ck in loaded}
+    if len(cfgs) != 1:
+        raise ValueError(f"checkpoints disagree on the model: {cfgs}")
+    model_cfg = model_cfg_from(loaded[0][1]["config"])
     map_names = tuple(M.HELDOUT_MAPS) + tuple(UNSEEN_MAPS)
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = []
     for setting in settings:
         t0 = time.time()
         evaluate = make_evaluator(map_names, episodes, max_steps, randomize=(setting == "randomized"),
-                                  hidden_dim=hidden_dim, wrapper_kwargs=wrapper_kwargs_from(loaded[-1][1]["config"]))
+                                  model_cfg=model_cfg, wrapper_kwargs=wrapper_kwargs_from(loaded[-1][1]["config"]))
         print(f"[{setting}] evaluator built in {time.time() - t0:.0f}s", flush=True)
         for path, ck in loaded:
             rep = evaluate(ck["actor_params"], ck["normalizer"])

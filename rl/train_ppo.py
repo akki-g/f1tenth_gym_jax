@@ -24,6 +24,7 @@ import json
 import os
 import pathlib
 import time
+import types
 from typing import NamedTuple
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -40,10 +41,13 @@ from safetensors.numpy import load_file, save_file  # noqa: E402
 from . import car_params as cp  # noqa: E402
 from . import maps as M  # noqa: E402
 from .networks import (  # noqa: E402
+    MODEL_KEYS,
     NORM_SLICE,
     Actor,
+    CnnGru,
     Critic,
     Normalizer,
+    gru_unroll,
     log_prob_from_pre_tanh,
     policy_distribution,
     sample_action,
@@ -67,14 +71,26 @@ class Config:
     clip_eps: float = 0.2
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    ent_coef: float = 0.001
+    ent_coef: float = 0.005  # phase 1c (phase 1: 0.001; its policy std collapsed 0.60 -> 0.03)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
+    optimizer: str = "adam"  # adam | adamw
+    weight_decay: float = 0.0  # adamw only
     # network
-    hidden_dim: int = 256
+    arch: str = "mlp"  # mlp | cnn_gru
+    hidden_dim: int = 256  # mlp
+    mlp_layers: int = 2  # mlp hidden layers
     log_std_init: float = -0.5
+    gru_dim: int = 128  # cnn_gru
+    proj_dim: int = 128  # cnn_gru: CNN features -> GRU input projection
+    seq_len: int = 64  # cnn_gru: BPTT chunk; minibatches hold whole chunks
+    gru_critic_detach: bool = False  # cnn_gru: value loss trains only the critic head, not the shared trunk
+    # observation
+    num_beams: int = cp.NUM_BEAMS  # 271 (phase 1: 109)
+    frame_stack: int = 3  # mlp baselines 3 and 8; cnn_gru 1
     # env
     randomize: bool = True
+    max_delay: int = cp.MAX_DELAY_STEPS  # action delay 0..max_delay policy steps per episode
     # episode ends beyond collisions (car_params; 0 turns a check off)
     wall_margin: float = cp.WALL_MARGIN
     wall_margin_noise: float = cp.WALL_MARGIN_NOISE
@@ -98,7 +114,26 @@ class Config:
 
     def wrapper_kwargs(self) -> dict:
         return {"wall_margin": self.wall_margin, "wall_margin_noise": self.wall_margin_noise,
-                "wrong_way_steps": self.wrong_way_steps, "stall_steps": self.stall_steps}
+                "wrong_way_steps": self.wrong_way_steps, "stall_steps": self.stall_steps,
+                "frame_stack": self.frame_stack, "max_delay": self.max_delay}
+
+    def model_cfg(self) -> dict:
+        return {k: getattr(self, k) for k in MODEL_KEYS}
+
+    def validate(self):
+        if self.optimizer not in ("adam", "adamw"):
+            raise ValueError(f"optimizer must be adam or adamw, not {self.optimizer!r}")
+        if self.mlp_layers < 1:
+            raise ValueError("mlp_layers must be >= 1")
+        if self.arch not in ("mlp", "cnn_gru"):
+            raise ValueError(f"arch must be mlp or cnn_gru, not {self.arch!r}")
+        if self.arch == "cnn_gru":
+            if self.frame_stack != 1:
+                raise ValueError("cnn_gru takes one frame (frame_stack 1); the GRU carries history")
+            if self.num_steps % self.seq_len:
+                raise ValueError("seq_len must divide num_steps")
+            if (self.num_envs * self.num_steps // self.seq_len) % self.num_minibatches:
+                raise ValueError("num_minibatches must divide the number of sequences")
 
     @property
     def num_updates(self) -> int:
@@ -127,16 +162,20 @@ class Transition(NamedTuple):
     done: jax.Array
     raw_norm_inputs: jax.Array  # raw speed / previous action, for the normalizer
     info: dict
+    h_in: jax.Array  # cnn_gru: hidden state this step started from (after a reset); mlp: unused
+    first: jax.Array  # this step starts an episode (the previous step was done)
 
 
 class Runner(NamedTuple):
-    actor: TrainState
-    critic: TrainState
+    actor: TrainState  # cnn_gru: the whole actor-critic (shared trunk)
+    critic: TrainState | None  # cnn_gru: None
     normalizer: Normalizer
     env_states: tuple
     obs: jax.Array
     key: jax.Array
     update: jax.Array
+    h: jax.Array  # cnn_gru: [num_envs, gru_dim] state after the last step; not checkpointed
+    first: jax.Array  # [num_envs] the next step starts an episode
 
 
 INFO_KEYS = (
@@ -173,14 +212,91 @@ def compute_gae(reward, value, done, last_value, gamma, lam):
     return adv, adv + value
 
 
-def make_trainer(config: Config, env: M.MultiMapEnv):
-    actor_net = Actor(config.hidden_dim, env.action_dim, config.log_std_init)
-    critic_net = Critic(config.hidden_dim)
+def _make_tx(config: Config):
     n_opt_steps = config.num_updates * config.update_epochs * config.num_minibatches
+    lr = optax.linear_schedule(config.lr, 0.0, n_opt_steps) if config.anneal_lr else config.lr
+    if config.optimizer == "adamw":
+        opt = optax.adamw(lr, eps=1e-5, weight_decay=config.weight_decay)
+    else:
+        opt = optax.adam(lr, eps=1e-5)
+    return optax.chain(optax.clip_by_global_norm(config.max_grad_norm), opt)
+
+
+def _strip_weak_types(runner):
+    # drop weak types (e.g. the env's jnp.full(n, 0)): update() outputs are
+    # strongly typed, and a signature change would recompile it
+    return jax.tree.map(lambda x: x.astype(x.dtype) if isinstance(x, jax.Array) else x, runner)
+
+
+def _ppo_terms(config: Config, mean, log_std, value, t, adv, targets):
+    """Clipped PPO policy and value losses (shared by both architectures)."""
+    dist = policy_distribution(mean, log_std)
+    logp = log_prob_from_pre_tanh(dist, t.pre_tanh)
+    logratio = logp - t.log_prob
+    ratio = jnp.exp(logratio)
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    pg = -jnp.minimum(ratio * adv, jnp.clip(ratio, 1 - config.clip_eps, 1 + config.clip_eps) * adv).mean()
+    # entropy bonus on the pre-tanh Gaussian (the squashed one has no closed form)
+    entropy = dist.distribution.entropy().mean()
+    v_clipped = t.value + jnp.clip(value - t.value, -config.clip_eps, config.clip_eps)
+    v_loss = 0.5 * jnp.maximum((value - targets) ** 2, (v_clipped - targets) ** 2).mean()
+    total = pg - config.ent_coef * entropy + config.vf_coef * v_loss
+    aux = {
+        "policy_loss": pg,
+        "value_loss": v_loss,
+        "entropy": entropy,
+        "approx_kl": ((ratio - 1) - logratio).mean(),
+        "clipfrac": jnp.mean(jnp.abs(ratio - 1) > config.clip_eps),
+    }
+    return total, aux
+
+
+def _update_metrics(aux, traj, normalizer, actor_params):
+    info = traj.info
+    fin = info["returned_episode"].astype(jnp.float32)
+    metrics = {k: v.mean() for k, v in aux.items()}
+    metrics.update(
+        {
+            "episodes_finished": fin.sum(),
+            "episode_return": _masked_mean(info["episode_return"], fin),
+            "episode_length": _masked_mean(info["episode_length"], fin),
+            "completion_rate": _masked_mean(info["lap_complete"], fin),
+            "collision_rate": _masked_mean(info["collision"], fin),
+            "timeout_rate": _masked_mean(info["timeout"], fin),
+            "contact_rate": _masked_mean(info["contact"], fin),
+            "wall_buffer_rate": _masked_mean(info["wall_buffer"], fin),
+            "wrong_way_rate": _masked_mean(info["wrong_way"], fin),
+            "stall_rate": _masked_mean(info["stall"], fin),
+            "episode_progress_laps": _masked_mean(info["episode_progress"], fin),
+            "mean_speed": info["speed"].mean(),
+            "mean_step_reward": traj.reward.mean(),
+            "policy_std_speed": jnp.exp(actor_params["params"]["log_std"][0]),
+            "policy_std_steer": jnp.exp(actor_params["params"]["log_std"][1]),
+            "obs_norm_speed_mean": normalizer.mean[0],
+            **{f"params/{k}_std": _masked_std(info[k], fin) for k in ("param_mu", "param_m", "delay_k", "steer_offset")},
+            **{f"params/{k}_mean": _masked_mean(info[k], fin) for k in ("param_mu", "param_m", "delay_k")},
+            "nan_count": sum(jnp.sum(~jnp.isfinite(x)) for x in jax.tree.leaves(actor_params)),
+        }
+    )
+    episodes = {k: info[k] for k in EPISODE_FIELDS}
+    episodes["finished"] = info["returned_episode"]
+    return metrics, episodes
+
+
+def make_trainer(config: Config, env: M.MultiMapEnv):
+    """(init, jitted update, net, net-or-internals) for config.arch."""
+    config.validate()
+    if config.arch == "cnn_gru":
+        return make_recurrent_trainer(config, env)
+    return make_mlp_trainer(config, env)
+
+
+def make_mlp_trainer(config: Config, env: M.MultiMapEnv):
+    actor_net = Actor(config.hidden_dim, env.action_dim, config.log_std_init, config.mlp_layers)
+    critic_net = Critic(config.hidden_dim, config.mlp_layers)
 
     def make_tx():
-        lr = optax.linear_schedule(config.lr, 0.0, n_opt_steps) if config.anneal_lr else config.lr
-        return optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(lr, eps=1e-5))
+        return _make_tx(config)
 
     def init(key) -> Runner:
         k_actor, k_critic, k_env, key = jax.random.split(key, 4)
@@ -190,11 +306,10 @@ def make_trainer(config: Config, env: M.MultiMapEnv):
         actor = TrainState.create(apply_fn=actor_net.apply, params=actor_net.init(k_actor, dummy), tx=make_tx())
         critic = TrainState.create(apply_fn=critic_net.apply, params=critic_net.init(k_critic, dummy), tx=make_tx())
         obs, env_states = env.reset(k_env)
+        n = obs.shape[0]
         runner = Runner(actor.replace(step=step0), critic.replace(step=step0), Normalizer.create(),
-                        env_states, obs, key, step0)
-        # drop weak types (e.g. the env's jnp.full(n, 0)): update() outputs are
-        # strongly typed, and a signature change would recompile it
-        return jax.tree.map(lambda x: x.astype(x.dtype) if isinstance(x, jax.Array) else x, runner)
+                        env_states, obs, key, step0, jnp.zeros((n, 1)), jnp.ones((n,), bool))
+        return _strip_weak_types(runner)
 
     def env_step(carry, _):
         r: Runner = carry
@@ -204,32 +319,15 @@ def make_trainer(config: Config, env: M.MultiMapEnv):
         action, u, logp = sample_action(k_act, mean, log_std)
         value = critic_net.apply(r.critic.params, nobs)
         obs, env_states, reward, done, info = env.step(k_env, r.env_states, action)
-        t = Transition(nobs, u, logp, value, reward, done, r.obs[:, NORM_SLICE], {k: info[k] for k in INFO_KEYS})
-        return r._replace(env_states=env_states, obs=obs, key=key), t
+        t = Transition(nobs, u, logp, value, reward, done, r.obs[:, NORM_SLICE], {k: info[k] for k in INFO_KEYS},
+                       r.h, r.first)
+        return r._replace(env_states=env_states, obs=obs, key=key, first=done), t
 
     def losses(actor_params, critic_params, batch):
         t, adv, targets = batch
         mean, log_std = actor_net.apply(actor_params, t.obs)
-        dist = policy_distribution(mean, log_std)
-        logp = log_prob_from_pre_tanh(dist, t.pre_tanh)
-        logratio = logp - t.log_prob
-        ratio = jnp.exp(logratio)
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        pg = -jnp.minimum(ratio * adv, jnp.clip(ratio, 1 - config.clip_eps, 1 + config.clip_eps) * adv).mean()
-        # entropy bonus on the pre-tanh Gaussian (the squashed one has no closed form)
-        entropy = dist.distribution.entropy().mean()
         value = critic_net.apply(critic_params, t.obs)
-        v_clipped = t.value + jnp.clip(value - t.value, -config.clip_eps, config.clip_eps)
-        v_loss = 0.5 * jnp.maximum((value - targets) ** 2, (v_clipped - targets) ** 2).mean()
-        total = pg - config.ent_coef * entropy + config.vf_coef * v_loss
-        aux = {
-            "policy_loss": pg,
-            "value_loss": v_loss,
-            "entropy": entropy,
-            "approx_kl": ((ratio - 1) - logratio).mean(),
-            "clipfrac": jnp.mean(jnp.abs(ratio - 1) > config.clip_eps),
-        }
-        return total, aux
+        return _ppo_terms(config, mean, log_std, value, t, adv, targets)
 
     grad_fn = jax.value_and_grad(losses, argnums=(0, 1), has_aux=True)
 
@@ -259,50 +357,128 @@ def make_trainer(config: Config, env: M.MultiMapEnv):
         key, k_epochs = jax.random.split(r.key)
         (actor, critic, _), aux = jax.lax.scan(epoch, (r.actor, r.critic, k_epochs), None, length=config.update_epochs)
         normalizer = r.normalizer.update(traj.raw_norm_inputs)
-
-        info = traj.info
-        fin = info["returned_episode"].astype(jnp.float32)
-        metrics = {k: v.mean() for k, v in aux.items()}
-        metrics.update(
-            {
-                "episodes_finished": fin.sum(),
-                "episode_return": _masked_mean(info["episode_return"], fin),
-                "episode_length": _masked_mean(info["episode_length"], fin),
-                "completion_rate": _masked_mean(info["lap_complete"], fin),
-                "collision_rate": _masked_mean(info["collision"], fin),
-                "timeout_rate": _masked_mean(info["timeout"], fin),
-                "contact_rate": _masked_mean(info["contact"], fin),
-                "wall_buffer_rate": _masked_mean(info["wall_buffer"], fin),
-                "wrong_way_rate": _masked_mean(info["wrong_way"], fin),
-                "stall_rate": _masked_mean(info["stall"], fin),
-                "episode_progress_laps": _masked_mean(info["episode_progress"], fin),
-                "mean_speed": info["speed"].mean(),
-                "mean_step_reward": traj.reward.mean(),
-                "policy_std_speed": jnp.exp(actor.params["params"]["log_std"][0]),
-                "policy_std_steer": jnp.exp(actor.params["params"]["log_std"][1]),
-                "obs_norm_speed_mean": normalizer.mean[0],
-                **{f"params/{k}_std": _masked_std(info[k], fin) for k in ("param_mu", "param_m", "delay_k", "steer_offset")},
-                **{f"params/{k}_mean": _masked_mean(info[k], fin) for k in ("param_mu", "param_m", "delay_k")},
-                "nan_count": sum(jnp.sum(~jnp.isfinite(x)) for x in jax.tree.leaves(actor.params)),
-            }
-        )
-        episodes = {k: info[k] for k in EPISODE_FIELDS}
-        episodes["finished"] = info["returned_episode"]
-        new = Runner(actor, critic, normalizer, r.env_states, r.obs, key, r.update + 1)
+        metrics, episodes = _update_metrics(aux, traj, normalizer, actor.params)
+        new = Runner(actor, critic, normalizer, r.env_states, r.obs, key, r.update + 1, r.h, r.first)
         return new, metrics, episodes
 
     return init, jax.jit(update), actor_net, critic_net
 
 
+def make_recurrent_trainer(config: Config, env: M.MultiMapEnv):
+    """Recurrent PPO for cnn_gru (phase-1c spec, "Recurrent PPO changes").
+
+    Rollout: h is carried per env and zeroed where the previous step ended an
+    episode (``first``); each step stores the state it started from (h_in).
+    Update: each env's num_steps rollout is cut into seq_len chunks; epochs
+    permute whole chunks (not transitions) into num_minibatches minibatches;
+    the loss reruns CNN+GRU over each chunk from its stored h_in, applying the
+    same resets, and backpropagates through the chunk."""
+    model = CnnGru(config.num_beams, config.gru_dim, config.proj_dim, action_dim=env.action_dim,
+                   log_std_init=config.log_std_init)
+    chunks = config.num_steps // config.seq_len
+    n_seq = config.num_envs * chunks
+
+    def init(key) -> Runner:
+        k_net, k_env, key = jax.random.split(key, 3)
+        obs, env_states = env.reset(k_env)
+        n = obs.shape[0]
+        h0 = jnp.zeros((n, config.gru_dim))
+        params = model.init(k_net, h0[:1], jnp.zeros((1, env.obs_dim)))
+        step0 = jnp.zeros((), jnp.int32)
+        net = TrainState.create(apply_fn=model.apply, params=params, tx=_make_tx(config))
+        runner = Runner(net.replace(step=step0), None, Normalizer.create(), env_states, obs, key, step0,
+                        h0, jnp.ones((n,), bool))
+        return _strip_weak_types(runner)
+
+    def policy_step(params, h, first, nobs):
+        h_in = jnp.where(first[:, None], 0.0, h)
+        h_out, mean, log_std, value = model.apply(params, h_in, nobs)
+        return h_in, h_out, mean, log_std, value
+
+    def env_step(carry, _):
+        r: Runner = carry
+        key, k_act, k_env = jax.random.split(r.key, 3)
+        nobs = r.normalizer(r.obs)
+        h_in, h_out, mean, log_std, value = policy_step(r.actor.params, r.h, r.first, nobs)
+        action, u, logp = sample_action(k_act, mean, log_std)
+        obs, env_states, reward, done, info = env.step(k_env, r.env_states, action)
+        t = Transition(nobs, u, logp, value, reward, done, r.obs[:, NORM_SLICE], {k: info[k] for k in INFO_KEYS},
+                       h_in, r.first)
+        return r._replace(env_states=env_states, obs=obs, key=key, h=h_out, first=done), t
+
+    def to_sequences(x):
+        """[T, N, ...] -> [N * chunks, seq_len, ...]; sequence i = env i // chunks,
+        steps (i % chunks) * seq_len ... + seq_len - 1, in time order."""
+        x = x.reshape((chunks, config.seq_len, config.num_envs) + x.shape[2:])
+        x = jnp.moveaxis(x, 2, 0)
+        return x.reshape((n_seq, config.seq_len) + x.shape[3:])
+
+    def minibatches(seqs, key):
+        """Permute whole sequences: leaves [n_seq, L, ...] -> [M, n_seq / M, L, ...]."""
+        perm = jax.random.permutation(key, n_seq)
+        return jax.tree.map(lambda x: x[perm].reshape((config.num_minibatches, -1) + x.shape[1:]), seqs)
+
+    def recompute(params, t):
+        """Rerun the policy over a batch of sequences [S, L, ...] from their stored
+        start states. Returns (mean, log_std, value, h_in), batch-major."""
+        tm = lambda x: jnp.swapaxes(x, 0, 1)  # noqa: E731
+        mean, log_std, value, h_in, _ = gru_unroll(model, params, t.h_in[:, 0], tm(t.obs), tm(t.first),
+                                                   detach_critic=config.gru_critic_detach)
+        return tm(mean), log_std, tm(value), tm(h_in)
+
+    def losses(params, batch):
+        t, adv, targets = batch
+        mean, log_std, value, _ = recompute(params, t)
+        return _ppo_terms(config, mean, log_std, value, t, adv, targets)
+
+    grad_fn = jax.value_and_grad(losses, has_aux=True)
+
+    def update(r: Runner):
+        r, traj = jax.lax.scan(env_step, r, None, length=config.num_steps)
+        *_, last_value = policy_step(r.actor.params, r.h, r.first, r.normalizer(r.obs))
+        adv, targets = compute_gae(traj.reward, traj.value, traj.done, last_value, config.gamma, config.gae_lambda)
+        seqs = jax.tree.map(to_sequences, (traj._replace(info={}), adv, targets))
+
+        def epoch(carry, _):
+            net, key = carry
+            key, k = jax.random.split(key)
+
+            def minibatch(net, mb):
+                (_, aux), g = grad_fn(net.params, mb)
+                return net.apply_gradients(grads=g), aux
+
+            net, aux = jax.lax.scan(minibatch, net, minibatches(seqs, k))
+            return (net, key), aux
+
+        key, k_epochs = jax.random.split(r.key)
+        (net, _), aux = jax.lax.scan(epoch, (r.actor, k_epochs), None, length=config.update_epochs)
+        normalizer = r.normalizer.update(traj.raw_norm_inputs)
+        metrics, episodes = _update_metrics(aux, traj, normalizer, net.params)
+        # GRU health: a state that stops moving, or saturates, is not being used
+        metrics["gru_h_norm"] = jnp.linalg.norm(traj.h_in, axis=-1).mean()
+        metrics["gru_h_saturated"] = jnp.mean(jnp.abs(traj.h_in) > 0.99)
+        new = Runner(net, None, normalizer, r.env_states, r.obs, key, r.update + 1, r.h, r.first)
+        return new, metrics, episodes
+
+    internals = types.SimpleNamespace(model=model, env_step=env_step, policy_step=policy_step,
+                                      to_sequences=to_sequences, minibatches=minibatches,
+                                      recompute=recompute, losses=losses)
+    return init, jax.jit(update), model, internals
+
+
 # ---------------------------------------------------------------------------
 # Checkpoints: safetensors with the config (and update index) in metadata
 # ---------------------------------------------------------------------------
+def _ckpt_tree(runner: Runner, key) -> dict:
+    tree = {"actor": runner.actor, "normalizer": runner.normalizer, "key": key, "update": runner.update}
+    if runner.critic is not None:  # cnn_gru keeps the critic head inside actor
+        tree["critic"] = runner.critic
+    return tree
+
+
 def _state_dict(runner: Runner) -> dict:
-    sd = serialization.to_state_dict(
-        {"actor": runner.actor, "critic": runner.critic, "normalizer": runner.normalizer,
-         "key": jax.random.key_data(runner.key) if jnp.issubdtype(runner.key.dtype, jax.dtypes.prng_key) else runner.key,
-         "update": runner.update}
-    )
+    key = jax.random.key_data(runner.key) if jnp.issubdtype(runner.key.dtype, jax.dtypes.prng_key) else runner.key
+    sd = serialization.to_state_dict(_ckpt_tree(runner, key))
     return {k: np.asarray(v) for k, v in flatten_dict(sd, sep="/").items()}
 
 
@@ -317,15 +493,11 @@ def save_checkpoint(path: pathlib.Path, runner: Runner, config: Config, extra: d
 
 def restore_runner(path, template: Runner) -> Runner:
     flat = load_file(str(path))
-    base = flatten_dict(serialization.to_state_dict(
-        {"actor": template.actor, "critic": template.critic, "normalizer": template.normalizer,
-         "key": template.key, "update": template.update}), sep="/", keep_empty_nodes=True)
+    tree = _ckpt_tree(template, template.key)
+    base = flatten_dict(serialization.to_state_dict(tree), sep="/", keep_empty_nodes=True)
     merged = {k: (jnp.asarray(flat[k]) if k in flat else v) for k, v in base.items()}
-    sd = unflatten_dict(merged, sep="/")
-    restored = serialization.from_state_dict(
-        {"actor": template.actor, "critic": template.critic, "normalizer": template.normalizer,
-         "key": template.key, "update": template.update}, sd)
-    return template._replace(actor=restored["actor"], critic=restored["critic"],
+    restored = serialization.from_state_dict(tree, unflatten_dict(merged, sep="/"))
+    return template._replace(actor=restored["actor"], critic=restored.get("critic"),
                              normalizer=restored["normalizer"], key=restored["key"],
                              update=restored["update"])
 
@@ -387,6 +559,7 @@ def train(config: Config) -> pathlib.Path:
 
     from .evaluate import make_evaluator
 
+    config.validate()
     if config.num_updates < 1:
         raise ValueError("total_timesteps must cover one num_envs x num_steps rollout")
     if (config.num_envs * config.num_steps) % config.num_minibatches:
@@ -407,7 +580,7 @@ def train(config: Config) -> pathlib.Path:
     print(f"run dir: {run_dir}  ({config.num_updates} updates, backend {jax.default_backend()})", flush=True)
     t_build = time.time()
     env = M.MultiMapEnv(config.train_maps, config.num_envs, randomize=config.randomize,
-                        wrapper_kwargs=config.wrapper_kwargs())
+                        wrapper_kwargs=config.wrapper_kwargs(), num_beams=config.num_beams)
     init, update, _, _ = make_trainer(config, env)
     runner = jax.jit(init)(jax.random.PRNGKey(config.seed))
     latest = run_dir / "latest.safetensors"
@@ -419,7 +592,7 @@ def train(config: Config) -> pathlib.Path:
         print(f"resumed from {latest} at update {int(runner.update)}", flush=True)
     evaluate = make_evaluator(config.heldout_maps, config.eval_episodes, config.eval_max_steps,
                               wrapper_kwargs=config.wrapper_kwargs(),
-                              randomize=False, hidden_dim=config.hidden_dim)
+                              randomize=False, model_cfg=config.model_cfg())
 
     wandb.init(project=config.wandb_project, name=run_dir.name, id=f"{run_dir.name}", resume="allow",
                dir=str(run_dir), mode=config.wandb_mode, config=cfg_dict)

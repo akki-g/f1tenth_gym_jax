@@ -17,27 +17,33 @@ import numpy as np
 
 from . import car_params as cp
 from . import obs as ob
-from .networks import NORM_CLIP, Normalizer
+from .networks import NORM_CLIP, Normalizer, model_cfg_from
 
 
 def export(checkpoint, out) -> dict:
     from .train_ppo import load_checkpoint
 
     ck = load_checkpoint(checkpoint)
+    mc = model_cfg_from(ck["config"])
+    if mc["arch"] != "mlp":
+        raise NotImplementedError(f"export of arch {mc['arch']!r} (NumPy GRU forward pass) is not written yet")
+    num_beams, frame_stack = mc["num_beams"], mc["frame_stack"]
+    obs_dim = ob.obs_dim(frame_stack, num_beams)
     params = ck["actor_params"]["params"]
     mlp = params["mlp"]
-    layers = [mlp[f"Dense_{i}"] for i in range(3)]
+    layers = [mlp[f"Dense_{i}"] for i in range(len(mlp))]  # hidden layers + output
     normalizer: Normalizer = ck["normalizer"]
-    mean, std = normalizer.full_mean_std()
+    mean, std = normalizer.full_mean_std(obs_dim)
     config = {
         "format": "rl_phase1_policy_v1",
-        "obs_dim": ob.OBS_DIM,
-        "num_beams": ob.NUM_BEAMS,
+        "arch": "mlp",
+        "obs_dim": obs_dim,
+        "num_beams": num_beams,
         "car_scan_beams": ob.CAR_SCAN_BEAMS,
-        "beam_indices": ob.CAR_BEAM_INDICES.tolist(),
+        "beam_indices": ob.beam_indices(num_beams).tolist(),
         "fov": ob.FOV,
         "max_range": ob.MAX_RANGE,
-        "frame_stack": ob.FRAME_STACK,
+        "frame_stack": frame_stack,
         "v_cmd_max": ob.V_CMD_MAX,
         "steer_max": ob.S_MAX,
         "policy_rate_hz": cp.POLICY_RATE_HZ,

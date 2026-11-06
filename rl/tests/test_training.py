@@ -53,7 +53,7 @@ def test_normalizer_tracks_mean_std_of_non_scan_inputs():
     obs = jnp.asarray(rng.uniform(0, 1, size=(4, 330)).astype(np.float32))
     normed = n(obs)
     np.testing.assert_array_equal(normed[:, : NORM_SLICE.start], obs[:, : NORM_SLICE.start])  # scans untouched
-    mean, std = n.full_mean_std()
+    mean, std = n.full_mean_std(obs.shape[-1])
     np.testing.assert_allclose(normed, jnp.clip((obs - mean) / std, -10, 10), atol=1e-6)
 
 
@@ -76,7 +76,7 @@ def tiny_trainer():
     M.use_map_dir(M.DEFAULT_MAP_DIR)
     cfg = Config(num_envs=2, num_steps=8, total_timesteps=64, num_minibatches=2,
                  train_maps=("Duct1002", "Duct1003"), heldout_maps=("Duct1077",))
-    env = M.MultiMapEnv(cfg.train_maps, cfg.num_envs)
+    env = M.MultiMapEnv(cfg.train_maps, cfg.num_envs, wrapper_kwargs=cfg.wrapper_kwargs(), num_beams=cfg.num_beams)
     init, update, *_ = make_trainer(cfg, env)
     return cfg, init, update
 

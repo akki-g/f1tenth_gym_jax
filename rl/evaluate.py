@@ -25,7 +25,7 @@ import numpy as np
 
 from . import car_params as cp
 from . import maps as M
-from .networks import Actor, Normalizer, deterministic_action
+from .networks import make_policy, model_cfg_from
 
 DEFAULT_EVAL_MAX_STEPS = 6000  # 240 s at 25 Hz
 
@@ -36,25 +36,30 @@ def make_evaluator(
     max_steps: int = DEFAULT_EVAL_MAX_STEPS,
     randomize: bool = False,
     seed: int = 12345,
-    hidden_dim: int = 256,
+    model_cfg=None,
     wrapper_kwargs=None,
 ):
     """Returns evaluate(actor_params, normalizer) -> report dict.
 
-    ``wrapper_kwargs`` (wall margin, wrong-way and stall checks) default to
-    car_params; nominal evaluation uses the margin without noise."""
+    ``model_cfg`` (arch, beams, frame stack, sizes; see networks.model_cfg_from)
+    picks the policy; a recurrent policy's state is carried through each
+    episode and zeroed at every episode start. ``wrapper_kwargs`` (wall margin,
+    wrong-way and stall checks, max delay) default to car_params; nominal
+    evaluation uses the margin without noise."""
     from f1tenth_gym_jax.envs import F110Env
 
     from .domain_rand import make_param
     from .wrappers import Phase1Wrapper
 
-    actor = Actor(hidden_dim=hidden_dim)
+    model_cfg = model_cfg or model_cfg_from({})
+    init_carry, act = make_policy(model_cfg)
+    wk = {"frame_stack": model_cfg["frame_stack"], **(wrapper_kwargs or {})}
     wrappers = [
         Phase1Wrapper(
-            F110Env(1, make_param(m, randomize=randomize, max_steps=max_steps)),
+            F110Env(1, make_param(m, randomize=randomize, max_steps=max_steps, num_beams=model_cfg["num_beams"])),
             randomize,
             max_laps=1,
-            **(wrapper_kwargs or {}),
+            **wk,
         )
         for m in map_names
     ]
@@ -70,6 +75,8 @@ def make_evaluator(
             obs=obs,
             states=states,
             key=k_run,
+            carry=init_carry(n),
+            first=jnp.ones(n, bool),
             finished=jnp.zeros(n, bool),
             lap=jnp.zeros(n, bool),
             collision=jnp.zeros(n, bool),
@@ -86,8 +93,7 @@ def make_evaluator(
 
         def body(c):
             key, k = jax.random.split(c["key"])
-            mean, _ = actor.apply(actor_params, normalizer(c["obs"]))
-            action = deterministic_action(mean)
+            action, carry = act(actor_params, normalizer, c["obs"], c["carry"], c["first"])
             obs, states, _, done, info = jax.vmap(w.step)(jax.random.split(k, n), c["states"], action)
             first = done & ~c["finished"]
 
@@ -99,6 +105,8 @@ def make_evaluator(
                 obs=obs,
                 states=states,
                 key=key,
+                carry=carry,
+                first=done,  # the wrapper auto-resets: the next step starts a new episode
                 finished=c["finished"] | done,
                 lap=record(c["lap"], info["lap_complete"]),
                 collision=record(c["collision"], info["collision"]),
@@ -160,12 +168,19 @@ def make_evaluator(
     return evaluate
 
 
-WRAPPER_KEYS = ("wall_margin", "wall_margin_noise", "wrong_way_steps", "stall_steps")
+WRAPPER_KEYS = ("wall_margin", "wall_margin_noise", "wrong_way_steps", "stall_steps", "frame_stack", "max_delay")
 
 
 def wrapper_kwargs_from(config: dict) -> dict:
-    """The checkpoint's episode-end settings; older checkpoints get car_params' defaults."""
-    return {k: config[k] for k in WRAPPER_KEYS if k in config}
+    """The checkpoint's wrapper settings. Missing episode-end settings get
+    car_params' defaults; phase-1 checkpoints (no layout fields) get their
+    frame stack 3 and delay 0..2."""
+    from . import car_params as cp
+
+    legacy = "num_beams" not in config
+    out = {"frame_stack": cp.LEGACY_LAYOUT["frame_stack"], "max_delay": cp.LEGACY_LAYOUT["max_delay"]} if legacy else {}
+    out.update({k: config[k] for k in WRAPPER_KEYS if k in config})
+    return out
 
 
 def main(argv=None):
@@ -184,7 +199,7 @@ def main(argv=None):
     M.use_map_dir(args.map_dir)
     ckpt = load_checkpoint(args.checkpoint)
     evaluate = make_evaluator(args.maps, args.episodes, args.max_steps, args.randomize,
-                              hidden_dim=ckpt["config"]["hidden_dim"],
+                              model_cfg=model_cfg_from(ckpt["config"]),
                               wrapper_kwargs=wrapper_kwargs_from(ckpt["config"]))
     report = evaluate(ckpt["actor_params"], ckpt["normalizer"])
     report["checkpoint"] = str(args.checkpoint)

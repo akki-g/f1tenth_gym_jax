@@ -36,6 +36,8 @@ def unseen_gen_name(seed: int) -> str:
 UNSEEN_MAPS = UNSEEN_RACETRACKS + tuple(unseen_gen_name(s) for s in UNSEEN_GEN_SEEDS)
 assert not set(UNSEEN_MAPS) & set(M.TRAIN_MAPS + M.HELDOUT_MAPS)
 GROUPS = {"heldout": M.HELDOUT_MAPS, "unseen": UNSEEN_MAPS}
+# lab suite: lab-size tracks only (held-out: picks checkpoints; unseen: used by neither)
+SUITES = {"phase1c": GROUPS, "lab": {"heldout": M.LAB_HELDOUT_MAPS, "unseen": M.LAB_UNSEEN_MAPS}}
 
 
 def prepare_unseen(map_dir=M.DEFAULT_MAP_DIR) -> dict:
@@ -66,9 +68,15 @@ def _update_of(path: pathlib.Path) -> int:
     return int(m.group(1)) if m else -1
 
 
-def run(checkpoints, settings, episodes, max_steps, out_dir: pathlib.Path) -> dict:
-    from .evaluate import make_evaluator, wrapper_kwargs_from
+def run(checkpoints, settings, episodes, max_steps, out_dir: pathlib.Path, suite: str = "phase1c",
+        lab_physics: bool = False) -> dict:
+    """``lab_physics``: evaluate under the lab fine-tune's physics (rollover,
+    carpet friction, 0-240 ms delay) whatever the checkpoints trained with."""
+    from . import car_params as cp
+    from .evaluate import friction_from, make_evaluator, wrapper_kwargs_from
     from .train_ppo import load_checkpoint
+
+    groups = SUITES[suite]
 
     loaded = [(p, load_checkpoint(p)) for p in checkpoints]
     from .networks import model_cfg_from
@@ -77,25 +85,32 @@ def run(checkpoints, settings, episodes, max_steps, out_dir: pathlib.Path) -> di
     if len(cfgs) != 1:
         raise ValueError(f"checkpoints disagree on the model: {cfgs}")
     model_cfg = model_cfg_from(loaded[0][1]["config"])
-    map_names = tuple(M.HELDOUT_MAPS) + tuple(UNSEEN_MAPS)
+    map_names = tuple(n for names in groups.values() for n in names)
+    cfg = loaded[-1][1]["config"]
+    wrapper_kwargs, friction = wrapper_kwargs_from(cfg), friction_from(cfg)
+    if lab_physics:
+        wrapper_kwargs.update(rollover=True, max_delay=cp.LAB_MAX_DELAY_STEPS)
+        friction = cp.LAB_FRICTION
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = []
     for setting in settings:
         t0 = time.time()
         evaluate = make_evaluator(map_names, episodes, max_steps, randomize=(setting == "randomized"),
-                                  model_cfg=model_cfg, wrapper_kwargs=wrapper_kwargs_from(loaded[-1][1]["config"]))
+                                  model_cfg=model_cfg, wrapper_kwargs=wrapper_kwargs, friction=friction)
         print(f"[{setting}] evaluator built in {time.time() - t0:.0f}s", flush=True)
         for path, ck in loaded:
             rep = evaluate(ck["actor_params"], ck["normalizer"])
             rep.update(checkpoint=str(path), checkpoint_sha256=ck["sha256"], update=ck["update"])
             row = {"checkpoint": path.name, "update": ck["update"], "setting": setting,
                    "eval_seconds": round(rep["eval_seconds"], 1)}
-            for group, names in GROUPS.items():
+            for group, names in groups.items():
                 per = [rep["per_map"][n] for n in names]
                 row[f"{group}_completion"] = float(np.mean([v["completion_rate"] for v in per]))
                 row[f"{group}_collision"] = float(np.mean([v["collision_rate"] for v in per]))
+                row[f"{group}_rollover"] = float(np.mean([v.get("rollover_rate", 0.0) for v in per]))
                 row[f"{group}_worst"] = min((v["completion_rate"], n) for v, n in zip(per, names))
-            rep["groups"] = {g: list(n) for g, n in GROUPS.items()}
+            rep["groups"] = {g: list(n) for g, n in groups.items()}
+            rep.update(suite=suite, lab_physics=lab_physics)
             (out_dir / f"{setting}_{path.stem}.json").write_text(json.dumps(rep, indent=2))
             summary.append(row)
             print(f"[{setting}] {path.name} (update {ck['update']}): "
@@ -120,6 +135,8 @@ def main(argv=None):
     r.add_argument("--max-steps", type=int, default=6000)
     r.add_argument("--map-dir", default=str(M.DEFAULT_MAP_DIR))
     r.add_argument("--out-dir", type=pathlib.Path, default=None)
+    r.add_argument("--suite", choices=sorted(SUITES), default="phase1c")
+    r.add_argument("--lab-physics", action="store_true", help="rollover, carpet friction, 0-240 ms delay")
     args = parser.parse_args(argv)
 
     if args.cmd == "prepare":
@@ -135,7 +152,7 @@ def main(argv=None):
         raise SystemExit(f"no checkpoints found in {args.run_dir}")
     out = args.out_dir or pathlib.Path("runs/eval_sweep") / args.run_dir.name
     print("checkpoints:", [c.name for c in ckpts], "->", out, flush=True)
-    run(ckpts, args.settings, args.episodes, args.max_steps, out)
+    run(ckpts, args.settings, args.episodes, args.max_steps, out, suite=args.suite, lab_physics=args.lab_physics)
 
 
 if __name__ == "__main__":

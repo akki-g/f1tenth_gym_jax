@@ -38,6 +38,7 @@ def make_evaluator(
     seed: int = 12345,
     model_cfg=None,
     wrapper_kwargs=None,
+    friction=(),
 ):
     """Returns evaluate(actor_params, normalizer) -> report dict.
 
@@ -48,7 +49,7 @@ def make_evaluator(
     evaluation uses the margin without noise."""
     from f1tenth_gym_jax.envs import F110Env
 
-    from .domain_rand import make_param
+    from .domain_rand import friction_overrides, make_param
     from .wrappers import Phase1Wrapper
 
     model_cfg = model_cfg or model_cfg_from({})
@@ -56,7 +57,8 @@ def make_evaluator(
     wk = {"frame_stack": model_cfg["frame_stack"], **(wrapper_kwargs or {})}
     wrappers = [
         Phase1Wrapper(
-            F110Env(1, make_param(m, randomize=randomize, max_steps=max_steps, num_beams=model_cfg["num_beams"])),
+            F110Env(1, make_param(m, randomize=randomize, max_steps=max_steps, num_beams=model_cfg["num_beams"],
+                                  **friction_overrides(friction, randomize))),
             randomize,
             max_laps=1,
             **wk,
@@ -83,6 +85,7 @@ def make_evaluator(
             timeout=jnp.zeros(n, bool),
             wrong_way=jnp.zeros(n, bool),
             stall=jnp.zeros(n, bool),
+            rollover=jnp.zeros(n, bool),
             length=zeros,
             speed=zeros,
             progress=zeros,
@@ -113,13 +116,14 @@ def make_evaluator(
                 timeout=record(c["timeout"], info["timeout"]),
                 wrong_way=record(c["wrong_way"], info["wrong_way"]),
                 stall=record(c["stall"], info["stall"]),
+                rollover=record(c["rollover"], info["rollover"]),
                 length=record(c["length"], info["episode_length"].astype(jnp.float32)),
                 speed=record(c["speed"], info["episode_mean_speed"]),
                 progress=record(c["progress"], info["episode_progress"]),
             )
 
         out = jax.lax.while_loop(cond, body, init)
-        return {k: out[k] for k in ("finished", "lap", "collision", "timeout", "wrong_way", "stall",
+        return {k: out[k] for k in ("finished", "lap", "collision", "timeout", "wrong_way", "stall", "rollover",
                                     "length", "speed", "progress")}
 
     @jax.jit
@@ -141,6 +145,7 @@ def make_evaluator(
                 "timeout_rate": float(r["timeout"].mean()),
                 "wrong_way_rate": float(r["wrong_way"].mean()),
                 "stall_rate": float(r["stall"].mean()),
+                "rollover_rate": float(r["rollover"].mean()),
                 "lap_time_mean": float(lap_times.mean()) if len(lap_times) else None,
                 "lap_time_min": float(lap_times.min()) if len(lap_times) else None,
                 "mean_speed": float(r["speed"].mean()),
@@ -168,7 +173,14 @@ def make_evaluator(
     return evaluate
 
 
-WRAPPER_KEYS = ("wall_margin", "wall_margin_noise", "wrong_way_steps", "stall_steps", "frame_stack", "max_delay")
+WRAPPER_KEYS = ("wall_margin", "wall_margin_noise", "wrong_way_steps", "stall_steps", "frame_stack", "max_delay",
+                "rollover")
+
+
+def friction_from(config: dict) -> tuple:
+    """The checkpoint's friction range, () for car_params' default."""
+    hi = float(config.get("friction_hi", 0.0) or 0.0)
+    return (float(config["friction_lo"]), hi) if hi > 0 else ()
 
 
 def wrapper_kwargs_from(config: dict) -> dict:
@@ -200,7 +212,8 @@ def main(argv=None):
     ckpt = load_checkpoint(args.checkpoint)
     evaluate = make_evaluator(args.maps, args.episodes, args.max_steps, args.randomize,
                               model_cfg=model_cfg_from(ckpt["config"]),
-                              wrapper_kwargs=wrapper_kwargs_from(ckpt["config"]))
+                              wrapper_kwargs=wrapper_kwargs_from(ckpt["config"]),
+                              friction=friction_from(ckpt["config"]))
     report = evaluate(ckpt["actor_params"], ckpt["normalizer"])
     report["checkpoint"] = str(args.checkpoint)
     report["checkpoint_sha256"] = ckpt["sha256"]

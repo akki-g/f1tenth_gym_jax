@@ -40,6 +40,7 @@ from safetensors.numpy import load_file, save_file  # noqa: E402
 
 from . import car_params as cp  # noqa: E402
 from . import maps as M  # noqa: E402
+from .domain_rand import friction_overrides  # noqa: E402
 from .networks import (  # noqa: E402
     MODEL_KEYS,
     NORM_SLICE,
@@ -55,6 +56,9 @@ from .networks import (  # noqa: E402
 
 # fields that do not change the experiment, left out of the config hash
 _BOOKKEEPING = ("runs_root", "wandb_mode", "wandb_project", "time_limit", "map_dir", "fresh", "run_dir")
+# Fields added for the lab fine-tune: left out of the run hash at their defaults,
+# so earlier runs keep their directories (and resume).
+_HASH_OPTIONAL = {"rollover": False, "friction_lo": 0.0, "friction_hi": 0.0, "max_laps": cp.MAX_LAPS}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,6 +106,10 @@ class Config:
     wall_margin_noise: float = cp.WALL_MARGIN_NOISE
     wrong_way_steps: int = cp.WRONG_WAY_STEPS
     stall_steps: int = cp.STALL_STEPS
+    rollover: bool = False  # end episodes on tipping (car_params TIP_*; lab fine-tune)
+    friction_lo: float = 0.0  # friction_hi > 0: mu range [lo, hi] replaces car_params' (lab: 1.1-1.5)
+    friction_hi: float = 0.0
+    max_laps: int = cp.MAX_LAPS  # laps per training episode (evaluation always uses 1)
     train_maps: tuple = M.TRAIN_MAPS
     heldout_maps: tuple = M.HELDOUT_MAPS
     # checkpoints / evaluation
@@ -121,7 +129,10 @@ class Config:
     def wrapper_kwargs(self) -> dict:
         return {"wall_margin": self.wall_margin, "wall_margin_noise": self.wall_margin_noise,
                 "wrong_way_steps": self.wrong_way_steps, "stall_steps": self.stall_steps,
-                "frame_stack": self.frame_stack, "max_delay": self.max_delay}
+                "frame_stack": self.frame_stack, "max_delay": self.max_delay, "rollover": self.rollover}
+
+    def friction(self) -> tuple:
+        return (self.friction_lo, self.friction_hi) if self.friction_hi > 0 else ()
 
     def model_cfg(self) -> dict:
         from .race import PRIV_DIM
@@ -139,8 +150,12 @@ class Config:
             raise ValueError(f"arch must be mlp or cnn_gru, not {self.arch!r}")
         if self.race and self.arch != "cnn_gru":
             raise ValueError("phase 2 (race) trains the cnn_gru")
-        if self.init_from and self.arch != "cnn_gru":
-            raise ValueError("init_from loads a cnn_gru checkpoint")
+        if self.init_from and self.race and self.arch != "cnn_gru":
+            raise ValueError("phase 2 init_from loads a cnn_gru checkpoint")
+        if self.friction_hi > 0 and not 0 < self.friction_lo < self.friction_hi:
+            raise ValueError("friction range needs 0 < friction_lo < friction_hi")
+        if self.max_laps < 1:
+            raise ValueError("max_laps must be >= 1")
         if self.arch == "cnn_gru":
             if self.frame_stack != 1:
                 raise ValueError("cnn_gru takes one frame (frame_stack 1); the GRU carries history")
@@ -163,7 +178,8 @@ class Config:
         return d
 
     def hash(self) -> str:
-        d = {k: v for k, v in self.to_dict().items() if k not in _BOOKKEEPING}
+        d = {k: v for k, v in self.to_dict().items()
+             if k not in _BOOKKEEPING and not (k in _HASH_OPTIONAL and v == _HASH_OPTIONAL[k])}
         return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()[:10]
 
 
@@ -198,9 +214,9 @@ INFO_KEYS = (
     "episode_progress", "lap_complete", "collision", "timeout", "speed",
     "delay_k", "steer_offset", "param_mu", "param_m", "param_C_Sf", "param_C_Sr",
     "param_lf", "param_h", "param_I", "map_id",
-    "contact", "wall_buffer", "wrong_way", "stall", "margin",
+    "contact", "wall_buffer", "wrong_way", "stall", "margin", "rollover", "lat_accel",
 )
-EPISODE_FIELDS = tuple(k for k in INFO_KEYS if k not in ("returned_episode", "speed"))
+EPISODE_FIELDS = tuple(k for k in INFO_KEYS if k not in ("returned_episode", "speed", "lat_accel"))
 RACE_INFO_KEYS = ("car_contact", "won", "overtakes", "opp_type", "race_lead")
 
 
@@ -283,6 +299,9 @@ def _update_metrics(aux, traj, normalizer, actor_params):
             "wall_buffer_rate": _masked_mean(info["wall_buffer"], fin),
             "wrong_way_rate": _masked_mean(info["wrong_way"], fin),
             "stall_rate": _masked_mean(info["stall"], fin),
+            "rollover_rate": _masked_mean(info["rollover"], fin),
+            "lat_accel_abs_mean": jnp.abs(info["lat_accel"]).mean(),
+            "lat_accel_abs_max": jnp.abs(info["lat_accel"]).max(),
             "episode_progress_laps": _masked_mean(info["episode_progress"], fin),
             "mean_speed": info["speed"].mean(),
             "mean_step_reward": traj.reward.mean(),
@@ -587,16 +606,19 @@ def race_model(config: Config) -> CnnGru:
                   priv_dim=PRIV_DIM)
 
 
-def load_init_from(path, runner: Runner, init_pool=None):
+def load_init_from(path, runner: Runner, init_pool=None, copy_critic: bool = False):
     """Copy a phase-1c cnn_gru checkpoint's CNN, projection, GRU and actor head
-    (and its normalizer) into a fresh race runner. The critic head stays newly
-    initialized: its input gained the privileged block. Returns (runner, copied keys)."""
+    (and its normalizer) into a fresh runner. Race runners keep a new critic head
+    (its input gained the privileged block); ``copy_critic`` (fine-tunes with the
+    same inputs) copies it too. Optimizer state starts fresh. Returns (runner, copied keys)."""
     ck = load_checkpoint(path)
-    if ck["config"].get("arch") != "cnn_gru":
+    arch = ck["config"].get("arch", "mlp")
+    if init_pool is not None and arch != "cnn_gru":
         raise ValueError(f"{path} is not a cnn_gru checkpoint")
     src = flatten_dict(ck["actor_params"], sep="/")
     dst = flatten_dict(runner.actor.params, sep="/")
-    copied = [k for k, v in dst.items() if k in src and "critic_" not in k and tuple(src[k].shape) == tuple(v.shape)]
+    copied = [k for k, v in dst.items()
+              if k in src and (copy_critic or "critic_" not in k) and tuple(src[k].shape) == tuple(v.shape)]
     missing = [k for k in dst if "critic_" not in k and k not in copied]
     if missing:
         raise ValueError(f"checkpoint lacks (or mis-shapes) actor/trunk parameters: {missing}")
@@ -668,7 +690,8 @@ def train(config: Config) -> pathlib.Path:
     t_build = time.time()
     race = dict(opponents=True, gru_dim=config.gru_dim, snapshot_model=race_model(config)) if config.race else None
     env = M.MultiMapEnv(config.train_maps, config.num_envs, randomize=config.randomize,
-                        wrapper_kwargs=config.wrapper_kwargs(), race=race, num_beams=config.num_beams)
+                        wrapper_kwargs={**config.wrapper_kwargs(), "max_laps": config.max_laps}, race=race,
+                        num_beams=config.num_beams, **friction_overrides(config.friction(), config.randomize))
     init, update, _, internals = make_trainer(config, env)
     runner = jax.jit(init)(jax.random.PRNGKey(config.seed))
     latest = run_dir / "latest.safetensors"
@@ -679,12 +702,14 @@ def train(config: Config) -> pathlib.Path:
         best_score = best_info.get("best_score", -np.inf)
         print(f"resumed from {latest} at update {int(runner.update)}", flush=True)
     elif config.init_from:
-        runner, copied = load_init_from(config.init_from, runner, internals.init_pool if config.race else None)
-        print(f"initialized from {config.init_from}: {len(copied)} tensors (critic head new)", flush=True)
+        runner, copied = load_init_from(config.init_from, runner, internals.init_pool if config.race else None,
+                                        copy_critic=not config.race)
+        print(f"initialized from {config.init_from}: {len(copied)} tensors "
+              f"({'critic head new' if config.race else 'critic head copied'})", flush=True)
     if config.race and latest.exists():  # the pool is not checkpointed: restart it from the resumed policy
         runner = runner._replace(opp_pool=internals.init_pool(runner.actor.params, runner.normalizer))
     evaluate = make_evaluator(config.heldout_maps, config.eval_episodes, config.eval_max_steps,
-                              wrapper_kwargs=config.wrapper_kwargs(),
+                              wrapper_kwargs=config.wrapper_kwargs(), friction=config.friction(),
                               randomize=False, model_cfg=config.model_cfg())
 
     wandb.init(project=config.wandb_project, name=run_dir.name, id=f"{run_dir.name}", resume="allow",

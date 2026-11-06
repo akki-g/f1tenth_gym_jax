@@ -4,7 +4,8 @@
 # env-step budget for the rest of the allocation, then trains.
 #
 #   sbatch --export=ALL,INIT_FROM=runs/phase1c/<gru run>/best.safetensors slurm/phase2.sbatch
-#   options (env): VF_COEF (0.1), DETACH (1 = --gru-critic-detach), TRAIN_SECONDS (41400), SEED (0)
+#   options (env): VF_COEF (0.1), DETACH (1 = --gru-critic-detach), TRAIN_SECONDS (41400), SEED (0),
+#                  VENV, MAP_DIR (reuse another checkout's environment and tracks)
 #
 #SBATCH --job-name=rl-2-race
 #SBATCH --gres=gpu:1
@@ -19,7 +20,10 @@ cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 mkdir -p slurm/logs
 : "${INIT_FROM:?set INIT_FROM to a phase-1c cnn_gru checkpoint}"
 export PATH="$HOME/.local/bin:$PATH" XLA_PYTHON_CLIENT_PREALLOCATE=false WANDB_MODE=offline
-export F1TENTH_GYM_JAX_MAP_DIR="$PWD/rl/maps"
+# a second checkout (e.g. while phase-1c jobs pin the main one) can reuse the
+# main checkout's environment and tracks: VENV=<main>/.venv MAP_DIR=<main>/rl/maps
+export UV_PROJECT_ENVIRONMENT="${VENV:-$PWD/.venv}"
+export F1TENTH_GYM_JAX_MAP_DIR="${MAP_DIR:-$PWD/rl/maps}"
 TRAIN_SECONDS="${TRAIN_SECONDS:-41400}"
 ARGS=(--arch cnn_gru --frame-stack 1 --race true --init-from "$INIT_FROM" --critic-warmup 20
       --vf-coef "${VF_COEF:-0.1}" --ent-coef 0.005 --max-delay 4 --seed "${SEED:-0}" --num-envs 2048

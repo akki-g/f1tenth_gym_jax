@@ -163,6 +163,32 @@ class TestF110Env(unittest.TestCase):
         expected_reward = -env.params.timestep * env.params.timestep_ratio
         self.assertAlmostEqual(float(rewards["agent_0"]), expected_reward)
 
+    def test_progress_reward_wraps_at_the_lap_seam(self):
+        env = make(
+            "Spielberg_1_noscan_nocollision_progress_acceleration+steeringvelocity_1_5_v0"
+        )
+        _, state = env.reset(jax.random.key(0))
+        tl = float(env.track_length)
+
+        def progress(prev_s, curr_s):
+            st = state.replace(
+                last_frenet_states=state.frenet_states.at[0, 0].set(prev_s),
+                frenet_states=state.frenet_states.at[0, 0].set(curr_s),
+            )
+            return float(env.get_reward(st)["agent_0"])
+
+        # ordinary steps, forward and backward
+        self.assertAlmostEqual(progress(10.0, 10.3), 0.3, places=3)
+        self.assertAlmostEqual(progress(10.3, 10.0), -0.3, places=3)
+        # crossing s = 0 forward and backward
+        self.assertAlmostEqual(progress(tl - 0.2, 0.1), 0.3, places=3)
+        self.assertAlmostEqual(progress(0.1, tl - 0.2), -0.3, places=3)
+        # crossing s = 0 while the projection also jumps 6% of the lap ahead:
+        # a forward step, not about -1 lap
+        jump = 0.06 * tl
+        self.assertAlmostEqual(progress(tl - 0.2, jump - 0.2), jump, places=2)
+        self.assertAlmostEqual(progress(jump - 0.2, tl - 0.2), -jump, places=2)
+
     def test_smooth_single_track_model_steps_from_rest(self):
         env = make(
             "Spielberg_1_noscan_nocollision_progress_acceleration+steeringvelocity_1_5_v0",

@@ -576,12 +576,11 @@ class F110Env(MultiAgentEnv):
             prev = jnp.mod(prev, tl)
             curr = jnp.mod(curr, tl)
             diff = curr - prev
-            prog = jax.lax.select(
-                diff > 0.95 * tl,
-                diff - tl,
-                jax.lax.select(diff < -0.95 * tl, diff + tl, diff),
-            )
-            return prog
+            # wrap to [-tl/2, tl/2): a step never covers half a lap, so a
+            # change bigger than that is a crossing of s = 0. (Correcting only
+            # |diff| > 0.95 tl turned a crossing where the projection also
+            # jumped > 5% of the lap into about -1 lap of progress.)
+            return diff - tl * jnp.round(diff / tl)
 
         def alive_reward(i):
             # penalize collisions

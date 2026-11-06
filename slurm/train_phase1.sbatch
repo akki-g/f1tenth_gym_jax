@@ -63,16 +63,25 @@ if bad:
 print("maps:", len(maps), "all files match the manifest")
 PY
 
+# TOTAL_TIMESTEPS=auto: the shared phase-1c budget written by
+# slurm/phase1c_prep.sbatch from its 2048-env throughput probes
+if [ "${TOTAL_TIMESTEPS:-}" = auto ]; then
+  TOTAL_TIMESTEPS=$(python3 -c "import json; print(json.load(open('slurm/phase1c_budget.json'))['total_timesteps'])")
+  echo "budget from slurm/phase1c_budget.json: $TOTAL_TIMESTEPS env-steps"
+fi
+
 case "$MODE" in
   smoke)
     # 10 minutes of training (+ compile, final eval and checkpoint) with 256 envs
+    RUNS_ROOT="${RUNS_ROOT:-runs/smoke}"
     ARGS=(--num-envs 256 --time-limit 600 --eval-every 50 --checkpoint-every 25
-          --runs-root runs/smoke)
+          --runs-root "$RUNS_ROOT")
     ;;
   full)
     # spec hyperparameters; stop cleanly ~20 min before the wall clock
+    RUNS_ROOT="${RUNS_ROOT:-runs/phase1}"
     ARGS=(--num-envs 2048 --total-timesteps "${TOTAL_TIMESTEPS:-2e8}" --time-limit 41400
-          --runs-root runs/phase1)
+          --runs-root "$RUNS_ROOT")
     ;;
   *) echo "unknown MODE=$MODE (smoke|full)"; exit 2 ;;
 esac
@@ -83,7 +92,7 @@ esac
 uv run --frozen python -m rl.train_ppo "${ARGS[@]}" --wandb-mode offline "$@"
 
 if [ "$MODE" = smoke ]; then
-  RUN_DIR=$(ls -td runs/smoke/*/ | head -1)
+  RUN_DIR=$(ls -td "$RUNS_ROOT"/*/ | head -1)
   uv run --frozen python -m rl.check_smoke "$RUN_DIR" || true
 fi
 echo "done $(date -Is)"

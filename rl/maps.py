@@ -281,6 +281,149 @@ def generate_duct_track(seed: int):
 
 
 # ---------------------------------------------------------------------------
+# Lab-size tracks: short loops of air-duct walls, like the lab's carpet tracks
+# ---------------------------------------------------------------------------
+LAB_LENGTH = (10.0, 20.0)  # m, centerline length, uniform per track
+LAB_WIDTH = (1.0, 1.7)  # m, mean corridor width, uniform per track
+LAB_MIN_WIDTH = 0.9  # m, narrowest point anywhere
+LAB_MAX_WIDTH = 2.0  # m, widest point anywhere
+LAB_WALL = 0.30  # m, wall thickness (the ducts' diameter)
+LAB_MIN_RADIUS = 0.8  # m, tightest centerline corner (full lock turns at ~0.75 m)
+LAB_CLEARANCE = 0.1  # m, gap between the walls of corridors that run side by side
+LAB_WANDER = 0.15  # m, amplitude of each smooth wave in a wall's drift
+LAB_BUMPS = (0, 3)  # local bulges per wall (inclusive)
+LAB_BUMP_AMP = (0.10, 0.35)  # m, into or out of the corridor
+LAB_BUMP_SIGMA = (0.25, 0.9)  # m, along the track
+LAB_SQUARENESS = (2.0, 4.0)  # superellipse exponent of the base loop: 2 ellipse, 4 rounded rectangle
+
+
+def _blob_centerline(rng: np.random.RandomState, length: float) -> np.ndarray:
+    """Closed star-shaped loop: a superellipse (ellipse to rounded rectangle,
+    i.e. straights and room-corner turns) times 1 + sum_k a_k cos(k theta + phi_k)
+    (bulges and dents), stretched and rotated at random, run clockwise or
+    counter-clockwise, scaled to ``length``; 5 cm spacing."""
+    th = np.linspace(0.0, 2 * np.pi, 1440, endpoint=False)
+    p = rng.uniform(*LAB_SQUARENESS)
+    base = (np.abs(np.cos(th)) ** p + np.abs(np.sin(th)) ** p) ** (-1.0 / p)
+    wobble = np.ones_like(th)
+    for k in range(2, 2 + rng.randint(2, 6)):
+        wobble += rng.uniform(0.0, 0.30 / k**0.7) * np.cos(k * th + rng.uniform(0, 2 * np.pi))
+    r = base * wobble
+    xy = np.c_[r * np.cos(th) * rng.uniform(1.0, 1.8), r * np.sin(th)]
+    a = rng.uniform(0, 2 * np.pi)
+    xy = xy @ np.array([[np.cos(a), np.sin(a)], [-np.sin(a), np.cos(a)]])
+    if rng.rand() < 0.5:
+        xy = xy[::-1]
+    xy = _resample_closed(xy, 0.01)
+    perimeter = np.sum(np.hypot(*np.diff(np.vstack([xy, xy[:1]]), axis=0).T))
+    return _resample_closed(xy * (length / perimeter), 0.05)
+
+
+def _wall_drift(rng: np.random.RandomState, s: np.ndarray, length: float) -> np.ndarray:
+    """One wall's offset from the nominal half-width along arc length ``s``:
+    1-3 smooth periodic waves plus a few local bulges (periodic in s)."""
+    out = np.zeros_like(s)
+    for _ in range(rng.randint(1, 4)):
+        cycles = max(1, int(round(length / rng.uniform(2.0, 6.0))))
+        out += rng.uniform(0.0, LAB_WANDER) * np.sin(2 * np.pi * cycles * s / length + rng.uniform(0, 2 * np.pi))
+    for _ in range(rng.randint(LAB_BUMPS[0], LAB_BUMPS[1] + 1)):
+        d = np.abs(s - rng.uniform(0, length))
+        d = np.minimum(d, length - d)
+        amp = rng.uniform(*LAB_BUMP_AMP) * rng.choice([-1.0, 1.0])
+        out += amp * np.exp(-0.5 * (d / rng.uniform(*LAB_BUMP_SIGMA)) ** 2)
+    return out
+
+
+def generate_lab_track(seed: int):
+    """One lab-size track from ``seed``, or None if it fails the checks.
+
+    The two walls are placed independently around a blob centerline: each
+    drifts and bulges on its own, so the width varies along the track and one
+    wall can curve while the other runs straight. Written centerline: the
+    corridor's midline, with its local half-width on both sides.
+
+    Returns dict(free, resolution, origin, centerline, width, length,
+    min_radius, min_width, max_width).
+    """
+    from scipy.spatial import cKDTree
+
+    rng = np.random.RandomState(seed)
+    length = rng.uniform(*LAB_LENGTH)
+    xy = _blob_centerline(rng, length)
+    k = _curvature_closed(xy)  # signed: + turns left along the loop
+    min_radius = 1.0 / np.max(np.abs(k))
+    if min_radius < LAB_MIN_RADIUS:
+        return None
+
+    n = len(xy)
+    s = np.arange(n) * (length / n)
+    tangent = np.roll(xy, -1, axis=0) - np.roll(xy, 1, axis=0)
+    tangent /= np.linalg.norm(tangent, axis=1, keepdims=True)
+    normal = np.c_[-tangent[:, 1], tangent[:, 0]]  # points left
+    width = rng.uniform(*LAB_WIDTH)
+    w_left = width / 2 + _wall_drift(rng, s, length)
+    w_right = width / 2 + _wall_drift(rng, s, length)
+    # the wall on the inside of a bend must stay short of the bend's centre
+    with np.errstate(divide="ignore"):
+        inner_max = 0.85 / np.abs(k)
+    w_left = np.where(k > 0, np.minimum(w_left, inner_max), w_left)
+    w_right = np.where(k < 0, np.minimum(w_right, inner_max), w_right)
+    excess = np.maximum(w_left + w_right - LAB_MAX_WIDTH, 0.0)
+    w_left, w_right = w_left - excess / 2, w_right - excess / 2
+    deficit = np.maximum(LAB_MIN_WIDTH - (w_left + w_right), 0.0)
+    w_left, w_right = w_left + deficit / 2, w_right + deficit / 2
+    if np.any((k > 0) & (w_left > inner_max)) or np.any((k < 0) & (w_right > inner_max)):
+        return None
+    if np.min(np.minimum(w_left, w_right)) < 0.2:  # keep the corridor around the centerline
+        return None
+
+    # corridors must not merge: far-apart (along the track) points need two walls and a gap between them
+    reach = np.maximum(w_left, w_right)
+    tree = cKDTree(xy)
+    for i, j in tree.query_pairs(2 * reach.max() + 2 * LAB_WALL + LAB_CLEARANCE):
+        along = abs(i - j) * (length / n)
+        along = min(along, length - along)
+        need = reach[i] + reach[j] + 2 * LAB_WALL + LAB_CLEARANCE
+        if along > np.pi * need and np.hypot(*(xy[i] - xy[j])) < need:
+            return None
+
+    # render: a pixel is wall when its offset from the nearest centerline point
+    # lies in the wall band beyond that point's left or right face
+    res = GEN_RESOLUTION
+    pad = reach.max() + LAB_WALL + GEN_MARGIN
+    lo, hi = xy.min(axis=0) - pad, xy.max(axis=0) + pad
+    w_px, h_px = np.ceil((hi - lo) / res).astype(int)
+    gx, gy = np.meshgrid(lo[0] + (np.arange(w_px) + 0.5) * res, lo[1] + (np.arange(h_px) + 0.5) * res)
+    pix = np.c_[gx.ravel(), gy.ravel()]
+    _, j = tree.query(pix)
+    e = np.einsum("ij,ij->i", pix - xy[j], normal[j])
+    wall = ((e > w_left[j]) & (e <= w_left[j] + LAB_WALL)) | ((e < -w_right[j]) & (e >= -w_right[j] - LAB_WALL))
+    free = ~wall.reshape(h_px, w_px)
+
+    mid = xy + normal * ((w_left - w_right) / 2)[:, None]
+    half = (w_left + w_right) / 2
+    start = int(np.argmin(np.abs(k)))  # start on the straightest part
+    mid, half = np.roll(mid, -start, axis=0), np.roll(half, -start)
+    keep = slice(None, None, 2)  # 10 cm centerline spacing
+    centerline = np.c_[mid[keep], half[keep], half[keep]]
+    return dict(
+        free=free,
+        resolution=res,
+        origin=(float(lo[0]), float(lo[1])),
+        centerline=centerline,
+        width=float(width),
+        length=float(length),
+        min_radius=float(min_radius),
+        min_width=float(np.min(w_left + w_right)),
+        max_width=float(np.max(w_left + w_right)),
+    )
+
+
+def lab_name(seed: int) -> str:
+    return f"Lab{seed}"
+
+
+# ---------------------------------------------------------------------------
 # Fixed train / held-out lists (spec 4.3). Held-out maps are never trained on.
 # ---------------------------------------------------------------------------
 # Generator seeds: the first 11 seeds >= 1000 that pass generate_duct_track's
@@ -308,6 +451,21 @@ TRAIN_MAPS = TRAIN_RACETRACKS + tuple(gen_name(s) for s in TRAIN_GEN_SEEDS)
 HELDOUT_MAPS = HELDOUT_RACETRACKS + tuple(gen_name(s) for s in HELDOUT_GEN_SEEDS)
 assert not set(TRAIN_MAPS) & set(HELDOUT_MAPS)
 
+# Lab-size tracks (generate_lab_track): the first valid seeds from 2000 (train),
+# 2500 (held-out: checkpoint selection) and 2900 (never-seen: final evaluation).
+LAB_TRAIN_SEEDS = (2004, 2015, 2019, 2021, 2022, 2027, 2036, 2037, 2038, 2042, 2046, 2056,
+                   2068, 2069, 2071, 2081, 2082, 2093, 2094, 2096, 2100, 2101, 2103, 2107)
+LAB_HELDOUT_SEEDS = (2506, 2511, 2524, 2526, 2529, 2533)
+LAB_UNSEEN_SEEDS = (2902, 2903, 2904, 2906, 2907, 2910)
+LAB_TRAIN_MAPS = tuple(lab_name(s) for s in LAB_TRAIN_SEEDS)
+LAB_HELDOUT_MAPS = tuple(lab_name(s) for s in LAB_HELDOUT_SEEDS)
+LAB_UNSEEN_MAPS = tuple(lab_name(s) for s in LAB_UNSEEN_SEEDS)
+# Lab fine-tune: lab tracks plus the duct tracks (kept so wider corridors are not forgotten)
+LAB_FT_TRAIN_MAPS = LAB_TRAIN_MAPS + tuple(gen_name(s) for s in TRAIN_GEN_SEEDS)
+LAB_FT_HELDOUT_MAPS = LAB_HELDOUT_MAPS + tuple(gen_name(s) for s in HELDOUT_GEN_SEEDS[:2])
+assert not set(LAB_FT_TRAIN_MAPS) & set(LAB_FT_HELDOUT_MAPS + LAB_UNSEEN_MAPS)
+assert not set(LAB_FT_HELDOUT_MAPS) & set(LAB_UNSEEN_MAPS)
+
 DEFAULT_MAP_DIR = pathlib.Path(__file__).resolve().parent / "maps"
 
 
@@ -327,16 +485,19 @@ def prepare_maps(map_dir: os.PathLike = DEFAULT_MAP_DIR, maps=TRAIN_MAPS + HELDO
 
     map_dir = use_map_dir(map_dir)
     manifest = {"map_dir": str(map_dir), "maps": {}}
-    seeds = {gen_name(s): s for s in TRAIN_GEN_SEEDS + HELDOUT_GEN_SEEDS}
+    seeds = {gen_name(s): (generate_duct_track, s) for s in TRAIN_GEN_SEEDS + HELDOUT_GEN_SEEDS}
+    seeds.update({lab_name(s): (generate_lab_track, s)
+                  for s in LAB_TRAIN_SEEDS + LAB_HELDOUT_SEEDS + LAB_UNSEEN_SEEDS})
     for name in maps:
         if name in seeds:
+            gen, seed = seeds[name]
             track_dir = map_dir / name
             if not (track_dir / f"{name}.png").exists():
-                g = generate_duct_track(seeds[name])
+                g = gen(seed)
                 if g is None:
-                    raise RuntimeError(f"seed {seeds[name]} no longer yields a valid track")
+                    raise RuntimeError(f"seed {seed} no longer yields a valid track")
                 write_map(map_dir, name, g["free"], g["resolution"], g["origin"], g["centerline"])
-            entry = {"kind": "generated", "seed": seeds[name]}
+            entry = {"kind": "generated", "seed": seed, "generator": gen.__name__}
         else:
             track_dir = find_track_dir(name)  # downloads if missing
             entry = {"kind": "racetrack"}
@@ -357,6 +518,15 @@ def map_lists_config() -> dict:
         "heldout_maps": list(HELDOUT_MAPS),
         "train_gen_seeds": list(TRAIN_GEN_SEEDS),
         "heldout_gen_seeds": list(HELDOUT_GEN_SEEDS),
+        "lab_train_seeds": list(LAB_TRAIN_SEEDS),
+        "lab_heldout_seeds": list(LAB_HELDOUT_SEEDS),
+        "lab_unseen_seeds": list(LAB_UNSEEN_SEEDS),
+        "lab_generator": {
+            "length": list(LAB_LENGTH), "width": list(LAB_WIDTH), "min_width": LAB_MIN_WIDTH,
+            "max_width": LAB_MAX_WIDTH, "wall": LAB_WALL, "min_radius": LAB_MIN_RADIUS,
+            "clearance": LAB_CLEARANCE, "wander": LAB_WANDER, "bumps": list(LAB_BUMPS),
+            "bump_amp": list(LAB_BUMP_AMP), "bump_sigma": list(LAB_BUMP_SIGMA), "squareness": list(LAB_SQUARENESS),
+        },
         "generator": {
             "resolution": GEN_RESOLUTION,
             "wall": GEN_WALL,
@@ -459,11 +629,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Prepare phase-1 maps.")
     parser.add_argument("command", choices=["prepare", "list"])
     parser.add_argument("--map-dir", default=str(DEFAULT_MAP_DIR))
+    parser.add_argument("--lab", action="store_true", help="also the lab-size tracks (train, held-out, never-seen)")
     args = parser.parse_args(argv)
     if args.command == "list":
         print(json.dumps(map_lists_config(), indent=2))
         return
-    manifest = prepare_maps(args.map_dir)
+    maps = TRAIN_MAPS + HELDOUT_MAPS + ((LAB_TRAIN_MAPS + LAB_HELDOUT_MAPS + LAB_UNSEEN_MAPS) if args.lab else ())
+    manifest = prepare_maps(args.map_dir, maps)
     out = pathlib.Path(args.map_dir) / "manifest.json"
     out.write_text(json.dumps({**map_lists_config(), **manifest}, indent=2))
     print(f"prepared {len(manifest['maps'])} maps in {args.map_dir}; manifest {out}")

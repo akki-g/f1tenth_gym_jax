@@ -13,6 +13,7 @@ from rl import maps as M
 from rl import obs as ob
 
 ALL_GEN = M.TRAIN_GEN_SEEDS + M.HELDOUT_GEN_SEEDS
+ALL_LAB = M.LAB_TRAIN_SEEDS + M.LAB_HELDOUT_SEEDS + M.LAB_UNSEEN_SEEDS
 
 
 def point_in_polygon(poly, p) -> bool:
@@ -144,3 +145,71 @@ def test_multimap_env_shapes(prepared):
     np.testing.assert_array_equal(np.asarray(info["map_id"]), np.repeat(np.arange(16), 2))
     with pytest.raises(ValueError):
         M.MultiMapEnv(M.TRAIN_MAPS, num_envs=30)
+
+
+# ---------------------------------------------------------------------------
+# Lab-size tracks
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def lab_prepared():
+    map_dir = M.use_map_dir(M.DEFAULT_MAP_DIR)
+    M.prepare_maps(map_dir, M.LAB_TRAIN_MAPS + M.LAB_HELDOUT_MAPS + M.LAB_UNSEEN_MAPS)
+    return map_dir
+
+
+def test_lab_lists():
+    assert len(M.LAB_TRAIN_SEEDS) == 24 and len(M.LAB_HELDOUT_SEEDS) == 6 and len(M.LAB_UNSEEN_SEEDS) == 6
+    assert len(set(M.LAB_FT_TRAIN_MAPS)) == 32 and 2048 % len(M.LAB_FT_TRAIN_MAPS) == 0
+    assert not set(M.LAB_FT_TRAIN_MAPS) & set(M.LAB_FT_HELDOUT_MAPS)
+    assert not set(M.LAB_UNSEEN_MAPS) & set(M.LAB_FT_TRAIN_MAPS + M.LAB_FT_HELDOUT_MAPS)
+    assert M.map_lists_config()["lab_train_seeds"] == list(M.LAB_TRAIN_SEEDS)
+
+
+@pytest.mark.parametrize("seed", ALL_LAB)
+def test_lab_track_in_spec(lab_prepared, seed):
+    """Reproducible; length, mean width, narrowest/widest point and corner radius in
+    range; the written map matches the generator and the car fits everywhere."""
+    g, g2 = M.generate_lab_track(seed), M.generate_lab_track(seed)
+    assert g is not None and np.array_equal(g["free"], g2["free"])
+    assert M.LAB_LENGTH[0] <= g["length"] <= M.LAB_LENGTH[1]
+    assert M.LAB_WIDTH[0] <= g["width"] <= M.LAB_WIDTH[1]
+    assert M.LAB_MIN_WIDTH - 1e-9 <= g["min_width"] and g["max_width"] <= M.LAB_MAX_WIDTH + 1e-9
+    assert g["min_radius"] >= M.LAB_MIN_RADIUS
+    name = M.lab_name(seed)
+    img = np.asarray(Image.open(lab_prepared / name / f"{name}.png"))[::-1] > 127  # row 0 = bottom
+    np.testing.assert_array_equal(img, g["free"])
+    clearance = edt(g["free"]) * g["resolution"]
+    c = g["centerline"]
+    ij = np.round((c[:, :2] - np.asarray(g["origin"])) / g["resolution"] - 0.5).astype(int)
+    assert clearance[ij[:, 1], ij[:, 0]].min() >= 0.35  # half the car (0.155 m) with room to spare
+
+
+def test_lab_tracks_vary():
+    gs = [M.generate_lab_track(s) for s in M.LAB_TRAIN_SEEDS]
+    turns = [np.sign(np.sum(M._curvature_closed(g["centerline"][:, :2]))) for g in gs]
+    assert turns.count(1.0) >= 6 and turns.count(-1.0) >= 6  # both directions
+    assert np.median([g["max_width"] - g["min_width"] for g in gs]) > 0.3  # walls not parallel
+
+
+@pytest.mark.parametrize("seed", ALL_LAB)
+def test_lab_track_drivable(lab_prepared, seed):
+    """Pure pursuit on the centerline drives a full lap without touching a wall."""
+    collided, progress, steps = _pure_pursuit_lap(M.lab_name(seed), speed=1.5, lookahead=0.6)
+    assert not collided and progress >= 1.0, (collided, progress, steps)
+
+
+def test_lab_multimap_env_with_rollover_and_friction(lab_prepared):
+    from rl import car_params as cp
+    from rl.domain_rand import friction_overrides
+
+    maps = M.LAB_TRAIN_MAPS[:4]
+    env = M.MultiMapEnv(maps, num_envs=16, randomize=True, wrapper_kwargs={"rollover": True, "max_laps": 5,
+                                                                         "frame_stack": 1, "max_delay": 6},
+                        **friction_overrides(cp.LAB_FRICTION, True))
+    obs, states = jax.jit(env.reset)(jax.random.PRNGKey(0))
+    mu = np.concatenate([np.asarray(s.env_state.dyn_params.mu).ravel() for s in states])
+    assert mu.min() >= cp.LAB_FRICTION[0] - 1e-6 and mu.max() <= cp.LAB_FRICTION[1] + 1e-6 and mu.std() > 0.02
+    delays = np.concatenate([np.asarray(s.delay_k) for s in states])
+    assert delays.max() <= 6
+    obs, states, r, d, info = jax.jit(env.step)(jax.random.PRNGKey(1), states, jnp.tile(jnp.array([-0.5, 0.0]), (16, 1)))
+    assert "rollover" in info and info["lat_accel"].shape == (16,)

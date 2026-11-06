@@ -37,6 +37,17 @@ export F1TENTH_GYM_JAX_MAP_DIR="$PWD/rl/maps"   # prepared on the login node; no
 
 echo "host $(hostname)  job ${SLURM_JOB_ID:-local}  mode $MODE  start $(date -Is)"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv || true
+# Submitted with --constraint="h100|gpu32" a job may land on a V100 (32 GB).
+# CUDA 13 dropped Volta, so V100s use the CUDA 12 build of the same JAX
+# (.venv-cu12, built once on the login node). Same env-step budget either way;
+# a V100 just needs a longer wall clock (TRAIN_TIME_LIMIT_OTHER, and --time).
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
+case "$GPU_NAME" in
+  *H100*) TRAIN_TIME_LIMIT="${TRAIN_TIME_LIMIT_H100:-41400}" ;;
+  *)      export UV_PROJECT_ENVIRONMENT="$PWD/.venv-cu12"
+          TRAIN_TIME_LIMIT="${TRAIN_TIME_LIMIT_OTHER:-41400}" ;;
+esac
+echo "gpu '$GPU_NAME' -> env ${UV_PROJECT_ENVIRONMENT:-.venv}, training time limit ${TRAIN_TIME_LIMIT}s"
 uv run --frozen python -c "import jax; print('jax', jax.__version__, jax.devices()); assert jax.default_backend() == 'gpu'"
 
 # the tracks must already be on disk (compute nodes may have no internet)
@@ -80,7 +91,7 @@ case "$MODE" in
   full)
     # spec hyperparameters; stop cleanly ~20 min before the wall clock
     RUNS_ROOT="${RUNS_ROOT:-runs/phase1}"
-    ARGS=(--num-envs 2048 --total-timesteps "${TOTAL_TIMESTEPS:-2e8}" --time-limit 41400
+    ARGS=(--num-envs 2048 --total-timesteps "${TOTAL_TIMESTEPS:-2e8}" --time-limit "$TRAIN_TIME_LIMIT"
           --runs-root "$RUNS_ROOT")
     ;;
   *) echo "unknown MODE=$MODE (smoke|full)"; exit 2 ;;

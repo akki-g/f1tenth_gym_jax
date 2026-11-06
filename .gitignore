@@ -178,3 +178,4 @@ rl/maps/*
 !rl/maps/Duct*/
 !rl/maps/manifest.json
 slurm/logs/
+.venv-cu12/

@@ -91,6 +91,12 @@ class Config:
     # env
     randomize: bool = True
     max_delay: int = cp.MAX_DELAY_STEPS  # action delay 0..max_delay policy steps per episode
+    # phase 2 (1v1, cnn_gru): two cars, opponent pool, race reward, privileged critic
+    race: bool = False
+    init_from: str = ""  # phase-1c checkpoint: CNN, projection, GRU, actor head, normalizer (critic head is new)
+    critic_warmup: int = 20  # first updates train only the critic head (actor learning rate 0)
+    snapshot_every: int = 50  # updates between ego snapshots added to the opponent pool
+    snapshot_pool: int = 8  # past ego snapshots kept, besides the starting model
     # episode ends beyond collisions (car_params; 0 turns a check off)
     wall_margin: float = cp.WALL_MARGIN
     wall_margin_noise: float = cp.WALL_MARGIN_NOISE
@@ -118,7 +124,11 @@ class Config:
                 "frame_stack": self.frame_stack, "max_delay": self.max_delay}
 
     def model_cfg(self) -> dict:
-        return {k: getattr(self, k) for k in MODEL_KEYS}
+        from .race import PRIV_DIM
+
+        cfg = {k: getattr(self, k) for k in MODEL_KEYS if k != "priv_dim"}
+        cfg["priv_dim"] = PRIV_DIM if self.race else 0
+        return cfg
 
     def validate(self):
         if self.optimizer not in ("adam", "adamw"):
@@ -127,6 +137,10 @@ class Config:
             raise ValueError("mlp_layers must be >= 1")
         if self.arch not in ("mlp", "cnn_gru"):
             raise ValueError(f"arch must be mlp or cnn_gru, not {self.arch!r}")
+        if self.race and self.arch != "cnn_gru":
+            raise ValueError("phase 2 (race) trains the cnn_gru")
+        if self.init_from and self.arch != "cnn_gru":
+            raise ValueError("init_from loads a cnn_gru checkpoint")
         if self.arch == "cnn_gru":
             if self.frame_stack != 1:
                 raise ValueError("cnn_gru takes one frame (frame_stack 1); the GRU carries history")
@@ -176,6 +190,7 @@ class Runner(NamedTuple):
     update: jax.Array
     h: jax.Array  # cnn_gru: [num_envs, gru_dim] state after the last step; not checkpointed
     first: jax.Array  # [num_envs] the next step starts an episode
+    opp_pool: dict | None = None  # race: stacked snapshot params / normalizers [pool, ...]; not checkpointed
 
 
 INFO_KEYS = (
@@ -186,6 +201,7 @@ INFO_KEYS = (
     "contact", "wall_buffer", "wrong_way", "stall", "margin",
 )
 EPISODE_FIELDS = tuple(k for k in INFO_KEYS if k not in ("returned_episode", "speed"))
+RACE_INFO_KEYS = ("car_contact", "won", "overtakes", "opp_type", "race_lead")
 
 
 def _masked_mean(x, mask):
@@ -279,6 +295,15 @@ def _update_metrics(aux, traj, normalizer, actor_params):
         }
     )
     episodes = {k: info[k] for k in EPISODE_FIELDS}
+    if "won" in info:  # race: win rate and contact among opponent episodes
+        opp = fin * (info["opp_type"] != 0)
+        metrics.update({
+            "race/win_rate": _masked_mean(info["won"], opp),
+            "race/car_contact_rate": _masked_mean(info["car_contact"], opp),
+            "race/overtakes": _masked_mean(info["overtakes"].astype(jnp.float32), opp),
+            "race/opponent_episodes": opp.sum(),
+        })
+        episodes.update({k: info[k] for k in RACE_INFO_KEYS})
     episodes["finished"] = info["returned_episode"]
     return metrics, episodes
 
@@ -358,7 +383,7 @@ def make_mlp_trainer(config: Config, env: M.MultiMapEnv):
         (actor, critic, _), aux = jax.lax.scan(epoch, (r.actor, r.critic, k_epochs), None, length=config.update_epochs)
         normalizer = r.normalizer.update(traj.raw_norm_inputs)
         metrics, episodes = _update_metrics(aux, traj, normalizer, actor.params)
-        new = Runner(actor, critic, normalizer, r.env_states, r.obs, key, r.update + 1, r.h, r.first)
+        new = Runner(actor, critic, normalizer, r.env_states, r.obs, key, r.update + 1, r.h, r.first, r.opp_pool)
         return new, metrics, episodes
 
     return init, jax.jit(update), actor_net, critic_net
@@ -373,8 +398,11 @@ def make_recurrent_trainer(config: Config, env: M.MultiMapEnv):
     permute whole chunks (not transitions) into num_minibatches minibatches;
     the loss reruns CNN+GRU over each chunk from its stored h_in, applying the
     same resets, and backpropagates through the chunk."""
+    from .race import PRIV_DIM
+
     model = CnnGru(config.num_beams, config.gru_dim, config.proj_dim, action_dim=env.action_dim,
-                   log_std_init=config.log_std_init)
+                   log_std_init=config.log_std_init, priv_dim=PRIV_DIM if config.race else 0)
+    info_keys = INFO_KEYS + (RACE_INFO_KEYS if config.race else ())
     chunks = config.num_steps // config.seq_len
     n_seq = config.num_envs * chunks
 
@@ -386,9 +414,17 @@ def make_recurrent_trainer(config: Config, env: M.MultiMapEnv):
         params = model.init(k_net, h0[:1], jnp.zeros((1, env.obs_dim)))
         step0 = jnp.zeros((), jnp.int32)
         net = TrainState.create(apply_fn=model.apply, params=params, tx=_make_tx(config))
-        runner = Runner(net.replace(step=step0), None, Normalizer.create(), env_states, obs, key, step0,
-                        h0, jnp.ones((n,), bool))
+        normalizer = Normalizer.create()
+        pool = init_pool(params, normalizer) if config.race else None
+        runner = Runner(net.replace(step=step0), None, normalizer, env_states, obs, key, step0,
+                        h0, jnp.ones((n,), bool), pool)
         return _strip_weak_types(runner)
+
+    def init_pool(params, normalizer):
+        """Opponent pool: slot 0 the starting model, slots 1..K past snapshots (start as copies)."""
+        k = config.snapshot_pool + 1
+        stack = lambda x: jnp.broadcast_to(x, (k,) + jnp.shape(x))  # noqa: E731
+        return {"params": jax.tree.map(stack, params), "normalizer": jax.tree.map(stack, normalizer)}
 
     def policy_step(params, h, first, nobs):
         h_in = jnp.where(first[:, None], 0.0, h)
@@ -401,8 +437,11 @@ def make_recurrent_trainer(config: Config, env: M.MultiMapEnv):
         nobs = r.normalizer(r.obs)
         h_in, h_out, mean, log_std, value = policy_step(r.actor.params, r.h, r.first, nobs)
         action, u, logp = sample_action(k_act, mean, log_std)
-        obs, env_states, reward, done, info = env.step(k_env, r.env_states, action)
-        t = Transition(nobs, u, logp, value, reward, done, r.obs[:, NORM_SLICE], {k: info[k] for k in INFO_KEYS},
+        if config.race:
+            obs, env_states, reward, done, info = env.step(k_env, r.env_states, action, r.opp_pool)
+        else:
+            obs, env_states, reward, done, info = env.step(k_env, r.env_states, action)
+        t = Transition(nobs, u, logp, value, reward, done, r.obs[:, NORM_SLICE], {k: info[k] for k in info_keys},
                        h_in, r.first)
         return r._replace(env_states=env_states, obs=obs, key=key, h=h_out, first=done), t
 
@@ -432,6 +471,13 @@ def make_recurrent_trainer(config: Config, env: M.MultiMapEnv):
         return _ppo_terms(config, mean, log_std, value, t, adv, targets)
 
     grad_fn = jax.value_and_grad(losses, has_aux=True)
+    # critic warmup (phase 2): only the critic head learns while update < critic_warmup
+    critic_only = None
+    if config.race and config.critic_warmup > 0:
+        def _critic_leaf(path, _):
+            return any(getattr(p, "key", None) in ("critic_hidden", "critic_out") for p in path)
+
+        critic_only = _critic_leaf
 
     def update(r: Runner):
         r, traj = jax.lax.scan(env_step, r, None, length=config.num_steps)
@@ -445,6 +491,10 @@ def make_recurrent_trainer(config: Config, env: M.MultiMapEnv):
 
             def minibatch(net, mb):
                 (_, aux), g = grad_fn(net.params, mb)
+                if critic_only is not None:
+                    warm = r.update < config.critic_warmup
+                    g = jax.tree_util.tree_map_with_path(
+                        lambda path, x: x if critic_only(path, x) else jnp.where(warm, 0.0, x), g)
                 return net.apply_gradients(grads=g), aux
 
             net, aux = jax.lax.scan(minibatch, net, minibatches(seqs, k))
@@ -457,10 +507,10 @@ def make_recurrent_trainer(config: Config, env: M.MultiMapEnv):
         # GRU health: a state that stops moving, or saturates, is not being used
         metrics["gru_h_norm"] = jnp.linalg.norm(traj.h_in, axis=-1).mean()
         metrics["gru_h_saturated"] = jnp.mean(jnp.abs(traj.h_in) > 0.99)
-        new = Runner(net, None, normalizer, r.env_states, r.obs, key, r.update + 1, r.h, r.first)
+        new = Runner(net, None, normalizer, r.env_states, r.obs, key, r.update + 1, r.h, r.first, r.opp_pool)
         return new, metrics, episodes
 
-    internals = types.SimpleNamespace(model=model, env_step=env_step, policy_step=policy_step,
+    internals = types.SimpleNamespace(init_pool=init_pool,model=model, env_step=env_step, policy_step=policy_step,
                                       to_sequences=to_sequences, minibatches=minibatches,
                                       recompute=recompute, losses=losses)
     return init, jax.jit(update), model, internals
@@ -527,6 +577,43 @@ def load_checkpoint(path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2: start from a phase-1c checkpoint; snapshot pool
+# ---------------------------------------------------------------------------
+def race_model(config: Config) -> CnnGru:
+    """The race-format CnnGru (privileged critic), also used for snapshot opponents."""
+    from .race import PRIV_DIM
+
+    return CnnGru(config.num_beams, config.gru_dim, config.proj_dim, log_std_init=config.log_std_init,
+                  priv_dim=PRIV_DIM)
+
+
+def load_init_from(path, runner: Runner, init_pool=None):
+    """Copy a phase-1c cnn_gru checkpoint's CNN, projection, GRU and actor head
+    (and its normalizer) into a fresh race runner. The critic head stays newly
+    initialized: its input gained the privileged block. Returns (runner, copied keys)."""
+    ck = load_checkpoint(path)
+    if ck["config"].get("arch") != "cnn_gru":
+        raise ValueError(f"{path} is not a cnn_gru checkpoint")
+    src = flatten_dict(ck["actor_params"], sep="/")
+    dst = flatten_dict(runner.actor.params, sep="/")
+    copied = [k for k, v in dst.items() if k in src and "critic_" not in k and tuple(src[k].shape) == tuple(v.shape)]
+    missing = [k for k in dst if "critic_" not in k and k not in copied]
+    if missing:
+        raise ValueError(f"checkpoint lacks (or mis-shapes) actor/trunk parameters: {missing}")
+    params = unflatten_dict({k: (jnp.asarray(src[k]) if k in copied else v) for k, v in dst.items()}, sep="/")
+    net = runner.actor.replace(params=params, opt_state=runner.actor.tx.init(params))
+    runner = runner._replace(actor=net, normalizer=ck["normalizer"])
+    if init_pool is not None:
+        runner = runner._replace(opp_pool=init_pool(params, ck["normalizer"]))
+    return runner, copied
+
+
+def add_snapshot(pool: dict, slot: int, params, normalizer) -> dict:
+    return {"params": jax.tree.map(lambda p, x: p.at[slot].set(x), pool["params"], params),
+            "normalizer": jax.tree.map(lambda p, x: p.at[slot].set(x), pool["normalizer"], normalizer)}
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 def _resolve_run_dir(config: Config) -> pathlib.Path:
@@ -579,9 +666,10 @@ def train(config: Config) -> pathlib.Path:
 
     print(f"run dir: {run_dir}  ({config.num_updates} updates, backend {jax.default_backend()})", flush=True)
     t_build = time.time()
+    race = dict(opponents=True, gru_dim=config.gru_dim, snapshot_model=race_model(config)) if config.race else None
     env = M.MultiMapEnv(config.train_maps, config.num_envs, randomize=config.randomize,
-                        wrapper_kwargs=config.wrapper_kwargs(), num_beams=config.num_beams)
-    init, update, _, _ = make_trainer(config, env)
+                        wrapper_kwargs=config.wrapper_kwargs(), race=race, num_beams=config.num_beams)
+    init, update, _, internals = make_trainer(config, env)
     runner = jax.jit(init)(jax.random.PRNGKey(config.seed))
     latest = run_dir / "latest.safetensors"
     best_score = -np.inf
@@ -590,6 +678,11 @@ def train(config: Config) -> pathlib.Path:
         best_info = load_checkpoint(latest)["extra"]
         best_score = best_info.get("best_score", -np.inf)
         print(f"resumed from {latest} at update {int(runner.update)}", flush=True)
+    elif config.init_from:
+        runner, copied = load_init_from(config.init_from, runner, internals.init_pool if config.race else None)
+        print(f"initialized from {config.init_from}: {len(copied)} tensors (critic head new)", flush=True)
+    if config.race and latest.exists():  # the pool is not checkpointed: restart it from the resumed policy
+        runner = runner._replace(opp_pool=internals.init_pool(runner.actor.params, runner.normalizer))
     evaluate = make_evaluator(config.heldout_maps, config.eval_episodes, config.eval_max_steps,
                               wrapper_kwargs=config.wrapper_kwargs(),
                               randomize=False, model_cfg=config.model_cfg())
@@ -615,6 +708,11 @@ def train(config: Config) -> pathlib.Path:
         while int(runner.update) < config.num_updates:
             t0 = time.time()
             runner, metrics, episodes = update(runner)
+            if config.race and int(runner.update) % config.snapshot_every == 0:
+                n_snap = int(runner.update) // config.snapshot_every
+                slot = 1 + (n_snap - 1) % config.snapshot_pool  # slot 0 keeps the starting model
+                runner = runner._replace(opp_pool=add_snapshot(runner.opp_pool, slot, runner.actor.params,
+                                                               runner.normalizer))
             metrics = {k: float(v) for k, v in jax.device_get(metrics).items()}
             dt = time.time() - t0
             u = int(runner.update)

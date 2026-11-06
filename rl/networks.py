@@ -151,7 +151,12 @@ class CnnGru(nn.Module):
 
     One policy step: ``h' = GRU(h, [proj(CNN(scan)), speed, prev action])``,
     then ``mean, log_std = actor(h')`` and ``value = critic(h')``. The
-    observation must be a single frame (frame stack 1)."""
+    observation must be a single frame (frame stack 1).
+
+    Phase 2 (``priv_dim > 0``): the observation is
+    ``[scan, privileged (priv_dim), speed, prev action]`` and the critic head
+    reads ``[h', privileged]``. The actor path never touches the privileged
+    values (training-only: opponent pose, true velocities, vehicle params)."""
 
     num_beams: int = ob.NUM_BEAMS
     gru_dim: int = 128
@@ -159,6 +164,7 @@ class CnnGru(nn.Module):
     head_dim: int = 64
     action_dim: int = 2
     log_std_init: float = -0.5
+    priv_dim: int = 0
 
     def setup(self):
         hid = orthogonal(np.sqrt(2))
@@ -183,20 +189,24 @@ class CnnGru(nn.Module):
         for conv, (_, k, st) in zip(self.convs, CONV_LAYERS):
             x = nn.relu(conv(edge_pad(x, k, st)))
         x = nn.relu(self.proj(x.reshape(x.shape[:-2] + (-1,))))
-        return jnp.concatenate([x, obs[..., self.num_beams:]], axis=-1)
+        return jnp.concatenate([x, obs[..., -ob.NUM_NON_SCAN:]], axis=-1)  # speed, previous action
+
+    def privileged(self, obs):
+        return obs[..., self.num_beams : obs.shape[-1] - ob.NUM_NON_SCAN]
 
     def step(self, h, x):
         h, _ = self.gru(h, x)
         return h
 
-    def heads(self, h):
+    def heads(self, h, priv=None):
         mean = self.actor_out(nn.tanh(self.actor_hidden(h)))
-        value = self.critic_out(nn.tanh(self.critic_hidden(h)))[..., 0]
+        c = h if self.priv_dim == 0 else jnp.concatenate([h, priv], axis=-1)
+        value = self.critic_out(nn.tanh(self.critic_hidden(c)))[..., 0]
         return mean, self.log_std, value
 
     def __call__(self, h, obs):
         h = self.step(h, self.encode(obs))
-        mean, log_std, value = self.heads(h)
+        mean, log_std, value = self.heads(h, self.privileged(obs))
         return h, mean, log_std, value
 
 
@@ -218,16 +228,18 @@ def gru_unroll(model: CnnGru, params, h0, obs_seq, first_seq, detach_critic: boo
         return h, (h_in, h)
 
     _, (h_in, h_out) = jax.lax.scan(f, h0, (x, first_seq))
-    mean, log_std, value = model.apply(params, h_out, method=CnnGru.heads)
+    priv = model.apply(params, obs_seq, method=CnnGru.privileged)
+    mean, log_std, value = model.apply(params, h_out, priv, method=CnnGru.heads)
     if detach_critic:
-        _, _, value = model.apply(params, jax.lax.stop_gradient(h_out), method=CnnGru.heads)
+        _, _, value = model.apply(params, jax.lax.stop_gradient(h_out), priv, method=CnnGru.heads)
     return mean, log_std, value, h_in, h_out
 
 
 # ---------------------------------------------------------------------------
 # Model description shared by training, evaluation and export
 # ---------------------------------------------------------------------------
-MODEL_KEYS = ("arch", "num_beams", "frame_stack", "hidden_dim", "mlp_layers", "gru_dim", "proj_dim", "log_std_init")
+MODEL_KEYS = ("arch", "num_beams", "frame_stack", "hidden_dim", "mlp_layers", "gru_dim", "proj_dim", "log_std_init",
+              "priv_dim")
 
 
 def model_cfg_from(config: dict) -> dict:
@@ -235,7 +247,8 @@ def model_cfg_from(config: dict) -> dict:
     from . import car_params as cp
 
     out = {"arch": "mlp", "num_beams": cp.LEGACY_LAYOUT["num_beams"], "frame_stack": cp.LEGACY_LAYOUT["frame_stack"],
-           "hidden_dim": 256, "mlp_layers": 2, "gru_dim": 128, "proj_dim": 128, "log_std_init": -0.5}
+           "hidden_dim": 256, "mlp_layers": 2, "gru_dim": 128, "proj_dim": 128, "log_std_init": -0.5,
+           "priv_dim": 0}
     out.update({k: config[k] for k in MODEL_KEYS if k in config})
     return out
 
@@ -254,11 +267,15 @@ def make_policy(model_cfg: dict, action_dim: int = 2):
         return (lambda n: jnp.zeros((n, 1))), act
     if model_cfg["arch"] == "cnn_gru":
         model = CnnGru(model_cfg["num_beams"], model_cfg["gru_dim"], model_cfg["proj_dim"], action_dim=action_dim,
-                       log_std_init=model_cfg["log_std_init"])
+                       log_std_init=model_cfg["log_std_init"], priv_dim=model_cfg["priv_dim"])
+        n, k = model_cfg["num_beams"], model_cfg["priv_dim"]
 
         def act(params, normalizer, obs, carry, first):
             h_in = jnp.where(first[:, None], 0.0, carry)
-            h, mean, _, _ = model.apply(params, h_in, normalizer(obs))
+            o = normalizer(obs)
+            if k and o.shape[-1] == n + ob.NUM_NON_SCAN:  # a race policy on a solo env: zeros for the critic-only inputs
+                o = jnp.concatenate([o[..., :n], jnp.zeros(o.shape[:-1] + (k,)), o[..., n:]], axis=-1)
+            h, mean, _, _ = model.apply(params, h_in, o)
             return deterministic_action(mean), h
 
         return (lambda n: jnp.zeros((n, model_cfg["gru_dim"]))), act

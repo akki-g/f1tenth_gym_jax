@@ -34,7 +34,7 @@ from .dynamic_models import (
 from .integrator import integrate_euler, integrate_rk4
 
 # scanning
-from .laser_models import beam_offsets, get_scan_exact
+from .laser_models import beam_offsets, get_scan_exact, ray_rectangle_ranges
 from .multi_agent_env import MultiAgentEnv
 from .spaces import Box
 
@@ -111,6 +111,8 @@ class F110Env(MultiAgentEnv):
         _validate_positive_number("field of view", params.fov)
         _validate_positive_number("scan epsilon", params.eps)
         _validate_positive_number("max scan range", params.max_range)
+        if not isinstance(params.scan_other_agents, bool):
+            raise ValueError("scan_other_agents must be a bool")
         if not isinstance(params.scan_noise_std, Real) or params.scan_noise_std < 0:
             raise ValueError("scan noise std must be non-negative.")
         _validate_ordered_bounds("steering angle", params.s_min, params.s_max)
@@ -625,9 +627,28 @@ class F110Env(MultiAgentEnv):
         poses = poses.at[:, 0].add(offset * jnp.cos(poses[:, 2]))
         poses = poses.at[:, 1].add(offset * jnp.sin(poses[:, 2]))
         scans = get_scan_vmapped(poses)
+        if self.params.scan_other_agents and self.num_agents > 1:
+            scans = jnp.minimum(scans, self._agent_ranges(state, poses))
         noise = jax.random.normal(key, scans.shape) * self.params.scan_noise_std
         new_state = state.replace(scans=scans + noise)
         return new_state
+
+    def _agent_ranges(self, state: State, scan_poses: chex.Array) -> chex.Array:
+        """(num_agents, num_beams) ranges to the other cars' footprints from each
+        scan origin (max_range where a beam misses them all). The map raycast
+        sees only the occupancy grid, so without this a car ahead reads as
+        open track."""
+        verts = jax.vmap(partial(get_vertices, length=self.params.length, width=self.params.width))(
+            state.cartesian_states[:, [0, 1, 4]]
+        )  # (N, 4, 2)
+        n = self.num_agents
+        others = jnp.array([[j for j in range(n) if j != i] for i in range(n)])  # (N, N-1)
+
+        def one(pose, idx):
+            angles = pose[2] + self.beam_offsets
+            return ray_rectangle_ranges(pose[:2], angles, verts[idx], self.max_range)
+
+        return jax.vmap(one)(scan_poses, others)
 
     @partial(jax.jit, static_argnums=[0])
     def _collisions(self, state: State) -> State:

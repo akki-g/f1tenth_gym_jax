@@ -72,3 +72,40 @@ def get_scan_exact(
         return jnp.minimum(out[1], max_range)
 
     return jax.vmap(trace_ray)(cosines, sines)
+
+
+def ray_rectangle_ranges(origin: chex.Array, angles: chex.Array, rects: chex.Array, max_range: float) -> chex.Array:
+    """Distance along each ray to the nearest edge of a set of rectangles.
+
+    Parameters
+    ----------
+    origin : chex.Array, shape (2,)
+        Ray origin ``[x, y]`` (the LiDAR position).
+    angles : chex.Array, shape (num_beams,)
+        World-frame ray directions, rad.
+    rects : chex.Array, shape (num_rects, 4, 2)
+        Rectangle corners in winding order (e.g. ``get_vertices`` of other cars).
+    max_range : float
+        Returned where a ray hits no rectangle.
+
+    Returns
+    -------
+    chex.Array, shape (num_beams,)
+        Nearest hit distance per ray, capped at ``max_range``.
+    """
+    a = rects  # (R, 4, 2) segment starts
+    e = jnp.roll(rects, -1, axis=1) - rects  # (R, 4, 2) segment vectors
+    d = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)  # (B, 2)
+
+    def cross(u, v):
+        return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
+
+    ap = a[None] - origin  # (1, R, 4, 2)
+    dd = d[:, None, None, :]  # (B, 1, 1, 2)
+    denom = cross(dd, e[None])  # (B, R, 4)
+    safe = jnp.where(jnp.abs(denom) < 1e-12, 1.0, denom)
+    t = cross(ap, e[None]) / safe  # distance along the ray
+    u = cross(ap, dd) / safe  # position along the segment
+    hit = (jnp.abs(denom) >= 1e-12) & (t >= 0.0) & (u >= 0.0) & (u <= 1.0)
+    t = jnp.where(hit, t, max_range)
+    return jnp.minimum(jnp.min(t, axis=(1, 2)), max_range)

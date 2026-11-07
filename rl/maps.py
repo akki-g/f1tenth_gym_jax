@@ -295,6 +295,8 @@ LAB_BUMPS = (0, 3)  # local bulges per wall (inclusive)
 LAB_BUMP_AMP = (0.10, 0.35)  # m, into or out of the corridor
 LAB_BUMP_SIGMA = (0.25, 0.9)  # m, along the track
 LAB_SQUARENESS = (2.0, 4.0)  # superellipse exponent of the base loop: 2 ellipse, 4 rounded rectangle
+LAB_CORNER_WIDTH = (0.9, 1.1)  # m: corridors pinch to this in bends (the lab tracks are tight in corners)
+LAB_PINCH_CURVATURE = (0.3, 0.8)  # 1/m: no pinch below, full pinch above (radius 3.3 m -> 1.25 m)
 
 
 def _blob_centerline(rng: np.random.RandomState, length: float) -> np.ndarray:
@@ -361,8 +363,12 @@ def generate_lab_track(seed: int):
     tangent /= np.linalg.norm(tangent, axis=1, keepdims=True)
     normal = np.c_[-tangent[:, 1], tangent[:, 0]]  # points left
     width = rng.uniform(*LAB_WIDTH)
-    w_left = width / 2 + _wall_drift(rng, s, length)
-    w_right = width / 2 + _wall_drift(rng, s, length)
+    # corridors pinch in bends: from the mean width toward the corner width as the bend tightens
+    k_abs = np.convolve(np.abs(np.concatenate([k[-10:], k, k[:10]])), np.ones(21) / 21, mode="same")[10:-10]
+    pinch = np.clip((k_abs - LAB_PINCH_CURVATURE[0]) / (LAB_PINCH_CURVATURE[1] - LAB_PINCH_CURVATURE[0]), 0.0, 1.0)
+    nominal = width + (np.minimum(rng.uniform(*LAB_CORNER_WIDTH), width) - width) * pinch
+    w_left = nominal / 2 + _wall_drift(rng, s, length)
+    w_right = nominal / 2 + _wall_drift(rng, s, length)
     # the wall on the inside of a bend must stay short of the bend's centre
     with np.errstate(divide="ignore"):
         inner_max = 0.85 / np.abs(k)
@@ -427,8 +433,9 @@ def lab_name(seed: int) -> str:
 # Room tracks: a duct wall around a room with an island inside (the race layout)
 # ---------------------------------------------------------------------------
 ROOM_SIZE = ((5.0, 11.0), (4.0, 8.0))  # m, room (x, y) extent of the outer wall's inner face
-ROOM_CORNER = (0.8, 2.0)  # m, corner radius
-ROOM_GAP = ((0.9, 2.5), (0.9, 3.0))  # m, wall-face gap beside the island: left/right (x), front/back (y)
+ROOM_CORNER = (1.5, 3.0)  # m, corner radius (round enough that the turnarounds stay tight diagonally)
+ROOM_GAP = ((0.9, 1.4), (0.9, 3.0))  # m, wall-face gap beside the island: at its ends (the turnarounds,
+# tight like the lab tracks' corners) and along its sides (straights, up to open areas)
 ISLAND_MIN = (1.5, 0.4)  # m, smallest island length and width
 ROOM_MIN_GAP = 0.9  # m, narrowest corridor along a ray from the island centre (wall face to wall face)
 ROOM_MIN_WIDTH = 0.85  # m, narrowest corridor in the rendered map (twice the clearance on the centerline)
@@ -502,7 +509,7 @@ def generate_room_track(seed: int):
     W, H = rng.uniform(*ROOM_SIZE[0]), rng.uniform(*ROOM_SIZE[1])
     if not 1.0 <= W / H <= 2.2:
         return None
-    corner = min(rng.uniform(*ROOM_CORNER), H / 2 - 0.1)
+    corner = min(rng.uniform(*ROOM_CORNER), H / 2 - 0.1, W / 2 - 0.1)
     # island: a superellipse filling the room minus a gap to each wall (so the corridor runs from
     # ~0.9 m passages to ~3 m open areas), slightly rotated; its centre is the polar origin
     gl, gr = rng.uniform(*ROOM_GAP[0], size=2)
@@ -542,29 +549,307 @@ def room_name(seed: int) -> str:
     return f"Room{seed}"
 
 
+# ---------------------------------------------------------------------------
+# Duct layouts: every wall is a 0.30 m duct along a polyline (closed loops and free-ended walls)
+# ---------------------------------------------------------------------------
+def _seg(p0, p1, step=0.02):
+    p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
+    n = max(int(np.ceil(np.hypot(*(p1 - p0)) / step)), 1)
+    return p0 + np.linspace(0.0, 1.0, n + 1)[:, None] * (p1 - p0)
+
+
+def _arc(c, r, a0, a1, step=0.02):
+    n = max(int(np.ceil(abs(a1 - a0) * r / step)), 2)
+    a = np.linspace(a0, a1, n + 1)
+    return np.c_[c[0] + r * np.cos(a), c[1] + r * np.sin(a)]
+
+
+def _rounded_rect(x0, y0, x1, y1, r):
+    """Closed polyline of a rounded rectangle, counter-clockwise from the bottom edge."""
+    r = min(r, (x1 - x0) / 2, (y1 - y0) / 2)
+    return np.vstack([
+        _seg((x0 + r, y0), (x1 - r, y0)), _arc((x1 - r, y0 + r), r, -np.pi / 2, 0.0),
+        _seg((x1, y0 + r), (x1, y1 - r)), _arc((x1 - r, y1 - r), r, 0.0, np.pi / 2),
+        _seg((x1 - r, y1), (x0 + r, y1)), _arc((x0 + r, y1 - r), r, np.pi / 2, np.pi),
+        _seg((x0, y1 - r), (x0, y0 + r)), _arc((x0 + r, y0 + r), r, np.pi, 1.5 * np.pi)])
+
+
+def _periodic_spline(points, spacing=0.1):
+    from scipy.interpolate import CubicSpline
+
+    p = np.vstack([points, points[:1]])
+    t = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(p, axis=0).T))])
+    dense = CubicSpline(t, p, bc_type="periodic")(np.linspace(0.0, t[-1], int(t[-1] / 0.01), endpoint=False))
+    return _resample_closed(dense, spacing)
+
+
+def build_duct_track(walls, waypoints, reverse=False):
+    """Render ducts (polylines along the ducts' centre lines; 0.30 m thick) and a centerline: a
+    periodic spline through ``waypoints``, starting at waypoint 0 (``reverse``: same start, other
+    direction). Half-width: the clearance to the nearest wall at each centerline point."""
+    from scipy.ndimage import distance_transform_edt
+    from scipy.spatial import cKDTree
+
+    pts = np.vstack(walls)
+    res = GEN_RESOLUTION
+    lo, hi = pts.min(axis=0) - LAB_WALL - GEN_MARGIN, pts.max(axis=0) + LAB_WALL + GEN_MARGIN
+    w_px, h_px = np.ceil((hi - lo) / res).astype(int)
+    gx, gy = np.meshgrid(lo[0] + (np.arange(w_px) + 0.5) * res, lo[1] + (np.arange(h_px) + 0.5) * res)
+    d, _ = cKDTree(pts).query(np.c_[gx.ravel(), gy.ravel()])
+    free = (d > LAB_WALL / 2).reshape(h_px, w_px)
+    xy = _periodic_spline(np.asarray(waypoints, float))
+    if reverse:
+        xy = np.vstack([xy[:1], xy[:0:-1]])
+    # corridor cross-section: march along the normal to the first wall on each side
+    t = np.roll(xy, -1, axis=0) - np.roll(xy, 1, axis=0)
+    t /= np.linalg.norm(t, axis=1, keepdims=True)
+    normal = np.c_[-t[:, 1], t[:, 0]]  # left
+    steps = np.arange(0.0, 4.0, res / 2)
+
+    def reach(sign):
+        q = xy[:, None, :] + sign * steps[None, :, None] * normal[:, None, :]
+        ij = np.round((q - lo) / res - 0.5).astype(int)
+        inside = (ij[..., 0] >= 0) & (ij[..., 0] < w_px) & (ij[..., 1] >= 0) & (ij[..., 1] < h_px)
+        hit = ~free[np.clip(ij[..., 1], 0, h_px - 1), np.clip(ij[..., 0], 0, w_px - 1)] | ~inside
+        return steps[np.argmax(hit, axis=1)]
+
+    w_left, w_right = reach(1.0), reach(-1.0)
+    width = w_left + w_right
+    length = float(np.sum(np.hypot(*np.diff(np.vstack([xy, xy[:1]]), axis=0).T)))
+    min_radius = 1.0 / np.max(np.abs(_curvature_closed(_smooth_closed(xy, 3))))
+    clear = distance_transform_edt(free) * res - res / 2
+    ij = np.clip(np.round((xy - lo) / res - 0.5).astype(int), 0, [w_px - 1, h_px - 1])
+    return dict(free=free, resolution=res, origin=(float(lo[0]), float(lo[1])), centerline=np.c_[xy, w_left, w_right],
+                width=float(np.median(width)), length=length, min_radius=float(min_radius),
+                min_width=float(width.min()), max_width=float(width.max()), p95_width=float(np.percentile(width, 95)),
+                min_clearance=float(clear[ij[:, 1], ij[:, 0]].min()))
+
+
+def race_layout(W_gaps, island, c1, c2, pocket, hook_gap, g_top, corner, hook=True, spur=True, mirror=False):
+    """The last race's layout family (last_track.png): a rounded-rectangle room; a capsule island
+    in its lower part whose left side carries on up as a hook that curls right to a free end; a
+    spur from the right wall between them. The track runs up the right side, left under the spur,
+    U-turns around its end, right between spur and hook, U-turns around the hook's end, left along
+    the top, down the left side and round the bottom. All sizes are wall face to wall face (m):
+    W_gaps = (left, right, bottom) corridors, island = (width, straight length), c1 / c2 the
+    channels under / over the spur, pocket the turnaround beside the spur's end, hook_gap the
+    turnaround beside the hook's end, g_top the top corridor. Returns (walls, waypoints), the
+    waypoints counter-clockwise from the right side beside the island's top (``mirror``: hook
+    on the right, clockwise)."""
+    T = LAB_WALL / 2
+    g_l, g_r, g_b = W_gaps
+    w_i, straight = island
+    r_i = w_i / 2
+    W = g_l + w_i + g_r
+    yi_top = g_b + w_i + straight  # island's top face
+    y_s = yi_top + c1 + T  # spur centre line
+    y_h = (y_s + T + c2 + T) if spur else (yi_top + c1 + T)  # hook centre line
+    H = (y_h + T + g_top) if hook else (y_s + T + g_top)
+    outer = _rounded_rect(-T, -T, W + T, H + T, corner + T)
+    xc = g_l + r_i
+    walls = [outer, _rounded_rect(g_l + T, g_b + T, W - g_r - T, yi_top - T, r_i - T)]
+    x_v = g_l + T  # the hook's vertical part continues the island's left side
+    x_he = W - hook_gap - T  # hook end (centre)
+    x_se = g_l + LAB_WALL + pocket + T  # spur end (centre)
+    if hook:
+        r_h = 0.5
+        y0 = yi_top - r_i  # where the island's straight left side ends
+        walls.append(np.vstack([_seg((x_v, y0), (x_v, y_h - r_h)), _arc((x_v + r_h, y_h - r_h), r_h, np.pi, np.pi / 2),
+                                _seg((x_v + r_h, y_h), (x_he, y_h))]))
+    if spur:
+        walls.append(_seg((W + T, y_s), (x_se, y_s)))
+    xr, xl, yb = W - g_r / 2, g_l / 2, g_b / 2
+    y_top = H - g_top / 2
+    m = 0.4  # the U-turns enter and leave their channels this far from the outer walls (a driver's line)
+
+    def u_turn(cx, cy, r, left):
+        a = np.radians([-90, -135, 180, 135, 90]) if left else np.radians([-90, -45, 0, 45, 90])
+        return [(cx + r * np.cos(x), cy + r * np.sin(x)) for x in a]
+
+    pts = [(xr, yi_top - 1.0)]
+    if spur:  # a quarter-turn (open floor beside the island's top) into the channel under the spur
+        rj = min(1.0, max(0.6, xr - (x_se + 0.5)))
+        cj = (xr - rj, yi_top + m - rj)
+        pts += [(cj[0] + rj * np.cos(a), cj[1] + rj * np.sin(a)) for a in np.radians([0, 45])]
+    if spur:
+        top_of_turn = (y_h - T - m) if hook else (y_s + T + 1.0)
+        r1 = min((top_of_turn - (yi_top + m)) / 2, pocket - 0.35)
+        pts += u_turn(x_se - T, y_s, r1, left=True)  # around the spur's end
+        if hook:
+            r2 = min(y_h - (y_s + T + m), H - m - y_h, hook_gap - 0.35)
+            pts += u_turn(x_he + T, y_h, r2, left=False)  # around the hook's end
+    elif hook:
+        r2 = min(y_h - (yi_top + m), H - m - y_h, hook_gap - 0.35)
+        pts += [(xr, y_h - r2)] + u_turn(x_he + T, y_h, r2, left=False)[1:]
+    else:
+        pts += [(xr, H - corner)]
+    pts += [(xc, y_top), (xl + 0.3 * corner, H - 0.3 * corner - g_top / 2), (xl, H - corner - g_top / 2),
+            (xl, (yi_top + g_b) / 2), (xl, g_b + 0.3 * corner), (xc - 0.3 * w_i, yb), (xc + 0.3 * w_i, yb),
+            (xr, g_b + 0.3 * corner), (xr, (yi_top + g_b) / 2)]
+    if mirror:
+        walls = [np.c_[W - w[:, 0], w[:, 1]] for w in walls]
+        pts = [(W - x, y) for x, y in pts]
+    return walls, pts
+
+
 def last_race_track(reverse: bool = False):
-    """The previous race's track, estimated from one oblique photo (IMG_6226): a ~10 x 7 m
-    room, an island angled from the back-left toward the middle, leaving a ~0.9 m passage
-    along the back wall, ~1.8 m on the left, ~2 m on the right and a ~3 m open area in
-    front; the back wall dents in near the middle. Approximate: no measurements."""
-    th = np.linspace(0.0, 2 * np.pi, 720, endpoint=False)
-    W, H, corner = 10.0, 7.0, 1.6
-    centre = np.array([-0.6, 0.9])  # island centre, room centred at 0 (x right, y toward the back wall)
-    Li, Wi, ang, p = 5.6, 1.1, np.radians(-18.0), 2.6
-    a = th - ang
-    island = (np.abs(np.cos(a) / (Li / 2)) ** p + np.abs(np.sin(a) / (Wi / 2)) ** p) ** (-1.0 / p)
-    d = np.c_[np.cos(th), np.sin(th)]
-    t = np.linspace(0.0, 20.0, 4001)[:, None, None]
-    pts = centre[None, None] + t * d[None]
-    qx = np.maximum(np.abs(pts[..., 0]) - (W / 2 - corner), 0.0)
-    qy = np.maximum(np.abs(pts[..., 1]) - (H / 2 - corner), 0.0)
-    inside = (np.abs(pts[..., 0]) <= W / 2) & (np.abs(pts[..., 1]) <= H / 2) & (np.hypot(qx, qy) <= corner)
-    room = t[np.argmax(~inside, axis=0), 0, 0]
-    room -= _dent(th, np.radians(95.0), 0.35, 0.5)  # the back wall's inward step near the middle
-    return build_room_track(room, island, centre, reverse=reverse)
+    """The previous race's track from its layout sketch (last_track.png, not to scale), sized so
+    every corridor is 0.9-2.0 m: a 6.6 x 11.7 m room, a 3.2 m wide island, 1.2 m channels under
+    and over the spur, 1.3 / 1.75 m turnarounds at the spur's and the hook's ends. Starts on the
+    right side beside the island's top (the sketch's start line)."""
+    walls, pts = race_layout((1.5, 1.9, 1.8), (3.2, 2.2), 1.2, 1.2, 1.3, 1.75, 1.5, 2.4)
+    return build_duct_track(walls, pts, reverse=reverse)
 
 
-LAST_RACE_MAPS = ("LastRace", "LastRaceRev")
+LAST_RACE_MAPS = ("LastRace2", "LastRace2Rev")
+RACE_LIKE_CORRIDOR = (0.9, 2.0)  # m, narrowest / widest corridor of the race-like tracks
+
+
+def generate_race_like_track(seed: int):
+    """A track like the last race's (race_layout with random sizes; mirrored or not, either
+    direction; usually spur and hook, sometimes only one), or None if the corridor narrows
+    below 0.9 m, the centerline turns tighter than 0.75 m or comes within 0.3 m of a wall,
+    or the lap is not 14-40 m."""
+    rng = np.random.RandomState(seed)
+    variant = rng.choice(3, p=(0.6, 0.2, 0.2))
+    hook, spur = variant != 2, variant != 1
+    gaps = (rng.uniform(1.1, 1.8), rng.uniform(1.2, 2.0), rng.uniform(1.2, 1.9))
+    c1, c2 = rng.uniform(1.1, 1.6, size=2)  # wide enough for U-turns the car can make (radius >= ~0.85 m)
+    pocket, hook_gap = rng.uniform(1.3, 1.8), rng.uniform(1.4, 2.0)
+    g_top, corner = rng.uniform(1.1, 1.8), rng.uniform(1.6, 2.6)
+    # the island is wide enough that the hook reaches 0.8-1.6 m past the spur's end
+    reach = (0.8 + hook_gap + pocket + 2 * LAB_WALL - gaps[1]) if (spur and hook) else 1.2
+    island = (float(np.clip(reach + rng.uniform(0.0, 0.8), 1.2, 3.6)), rng.uniform(1.0, 5.5))
+    mirror, reverse = rng.rand() < 0.5, rng.rand() < 0.5
+    W = sum(gaps[:2]) + island[0]
+    if spur and hook and (W - hook_gap - LAB_WALL / 2) - (gaps[0] + LAB_WALL + pocket + LAB_WALL / 2) < 0.8:
+        return None  # the hook must reach past the spur's end
+    walls, pts = race_layout(gaps, island, c1, c2, pocket, hook_gap, g_top, corner, hook, spur, mirror)
+    g = build_duct_track(walls, pts, reverse=reverse)
+    # narrowest point strict; the widest 5% (where a corridor meets a turn diagonally) may exceed 2 m
+    # every corridor is drawn within 0.9-2.0 m above; check the narrowest point as rendered
+    # (where a corridor meets a turn, the diagonal across it is wider, as on the real track)
+    if g["min_width"] < RACE_LIKE_CORRIDOR[0]:
+        return None
+    if g["min_clearance"] < 0.3:  # the centerline keeps half the car plus margin from every wall
+        return None
+    if g["min_radius"] < 0.75 or not 14.0 <= g["length"] <= 40.0:
+        return None
+    return g
+
+
+def race_like_name(seed: int) -> str:
+    return f"RaceLike{seed}"
+
+
+# ---------------------------------------------------------------------------
+# Speed-trap tracks: lab-size loops with one long straight that opens up (2.0-3.0 m)
+# ---------------------------------------------------------------------------
+TRAP_LENGTH = (14.0, 26.0)  # m
+TRAP_STRETCH = (2.0, 3.0)  # length / width of the base loop: long straights
+TRAP_WIDTH = (1.0, 1.6)  # m, mean corridor width off the trap
+TRAP_STRAIGHT_WIDTH = (2.0, 3.0)  # m, the trap straight's width
+TRAP_MIN_STRAIGHT = 3.0  # m
+
+
+def generate_trap_track(seed: int):
+    """One speed-trap track, or None if it fails the checks: an elongated loop (superellipse,
+    rounded rectangle-ish, mild bulges) 14-26 m long; corners pinch to 0.9-1.1 m like the lab
+    loops; on the longest straight the outer wall pushes out so the corridor reaches U(2.0, 3.0) m,
+    with ramps over 30% of the straight (1-2 m), while the inner wall stays in line; elsewhere U(1.0, 1.6) m with
+    walls that wander a little. Starts at the beginning of the trap straight."""
+    from scipy.spatial import cKDTree
+
+    rng = np.random.RandomState(seed)
+    length = rng.uniform(*TRAP_LENGTH)
+    th = np.linspace(0.0, 2 * np.pi, 1440, endpoint=False)
+    p = rng.uniform(3.0, 4.5)
+    r = (np.abs(np.cos(th)) ** p + np.abs(np.sin(th)) ** p) ** (-1.0 / p)
+    for k_h in (2, 3):
+        r *= 1.0 + rng.uniform(0.0, 0.12 / k_h**0.7) * np.cos(k_h * th + rng.uniform(0, 2 * np.pi))
+    xy = np.c_[r * np.cos(th) * rng.uniform(*TRAP_STRETCH), r * np.sin(th)]
+    a = rng.uniform(0, 2 * np.pi)
+    xy = xy @ np.array([[np.cos(a), np.sin(a)], [-np.sin(a), np.cos(a)]])
+    if rng.rand() < 0.5:
+        xy = xy[::-1]
+    xy = _resample_closed(xy, 0.01)
+    xy = _resample_closed(xy * (length / np.sum(np.hypot(*np.diff(np.vstack([xy, xy[:1]]), axis=0).T))), 0.05)
+    k = _curvature_closed(xy)
+    min_radius = 1.0 / np.max(np.abs(k))
+    if min_radius < LAB_MIN_RADIUS:
+        return None
+    n = len(xy)
+    s = np.arange(n) * (length / n)
+    tangent = np.roll(xy, -1, axis=0) - np.roll(xy, 1, axis=0)
+    tangent /= np.linalg.norm(tangent, axis=1, keepdims=True)
+    normal = np.c_[-tangent[:, 1], tangent[:, 0]]
+    width = rng.uniform(*TRAP_WIDTH)
+    k_abs = np.convolve(np.abs(np.concatenate([k[-10:], k, k[:10]])), np.ones(21) / 21, mode="same")[10:-10]
+    pinch = np.clip((k_abs - LAB_PINCH_CURVATURE[0]) / (LAB_PINCH_CURVATURE[1] - LAB_PINCH_CURVATURE[0]), 0.0, 1.0)
+    nominal = width + (np.minimum(rng.uniform(*LAB_CORNER_WIDTH), width) - width) * pinch
+    # the trap: the longest straight run (|curvature| < 0.08 1/m), widened with 1 m cosine ramps
+    straight = k_abs < 0.08
+    if straight.all() or not straight.any():
+        return None
+    shift = int(np.argmin(straight))  # start the scan on a curved point so runs do not wrap
+    st = np.roll(straight, -shift)
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], st.astype(int), [0]])))
+    runs = edges.reshape(-1, 2)
+    i0, i1 = max(runs, key=lambda r_: r_[1] - r_[0])
+    if (i1 - i0) * (length / n) < TRAP_MIN_STRAIGHT:
+        return None
+    pos = (np.arange(n) - i0) * (length / n)
+    run_len = (i1 - i0) * (length / n)
+    ramp = np.clip(np.minimum(pos, run_len - pos) / np.clip(0.3 * run_len, 1.0, 2.0), 0.0, 1.0)
+    weight = np.where((pos >= 0) & (pos <= run_len), 0.5 - 0.5 * np.cos(np.pi * ramp), 0.0)
+    weight = np.roll(weight, shift)
+    trap_w = rng.uniform(*TRAP_STRAIGHT_WIDTH)
+    extra = np.maximum(width + (trap_w - width) * weight - nominal, 0.0)  # the trap's added width
+    side = -np.sign(np.sum(k))  # the outer wall pushes out (+: left; a counter-clockwise loop's outside is on its right)
+    w_left = nominal / 2 + 0.5 * _wall_drift(rng, s, length) + extra * (side > 0)
+    w_right = nominal / 2 + 0.5 * _wall_drift(rng, s, length) + extra * (side < 0)
+    with np.errstate(divide="ignore"):
+        inner_max = 0.85 / np.abs(k)
+    w_left = np.where(k > 0, np.minimum(w_left, inner_max), w_left)
+    w_right = np.where(k < 0, np.minimum(w_right, inner_max), w_right)
+    excess = np.maximum(w_left + w_right - TRAP_STRAIGHT_WIDTH[1], 0.0)
+    w_left, w_right = w_left - excess / 2, w_right - excess / 2
+    deficit = np.maximum(LAB_MIN_WIDTH - (w_left + w_right), 0.0)
+    w_left, w_right = w_left + deficit / 2, w_right + deficit / 2
+    if np.any((k > 0) & (w_left > inner_max)) or np.any((k < 0) & (w_right > inner_max)):
+        return None
+    reach = np.maximum(w_left, w_right)
+    tree = cKDTree(xy)
+    for i, j in tree.query_pairs(2 * reach.max() + 2 * LAB_WALL + LAB_CLEARANCE):
+        along = abs(i - j) * (length / n)
+        along = min(along, length - along)
+        need = reach[i] + reach[j] + 2 * LAB_WALL + LAB_CLEARANCE
+        if along > np.pi * need and np.hypot(*(xy[i] - xy[j])) < need:
+            return None
+    res = GEN_RESOLUTION
+    pad = reach.max() + LAB_WALL + GEN_MARGIN
+    lo, hi = xy.min(axis=0) - pad, xy.max(axis=0) + pad
+    w_px, h_px = np.ceil((hi - lo) / res).astype(int)
+    gx, gy = np.meshgrid(lo[0] + (np.arange(w_px) + 0.5) * res, lo[1] + (np.arange(h_px) + 0.5) * res)
+    pix = np.c_[gx.ravel(), gy.ravel()]
+    _, j = tree.query(pix)
+    e = np.einsum("ij,ij->i", pix - xy[j], normal[j])
+    wall = ((e > w_left[j]) & (e <= w_left[j] + LAB_WALL)) | ((e < -w_right[j]) & (e >= -w_right[j] - LAB_WALL))
+    free = ~wall.reshape(h_px, w_px)
+    mid = xy + normal * ((w_left - w_right) / 2)[:, None]
+    half = (w_left + w_right) / 2
+    start = (int(i0) + shift) % n  # the trap's start
+    mid, half = np.roll(mid, -start, axis=0), np.roll(half, -start)
+    keep = slice(None, None, 2)
+    return dict(free=free, resolution=res, origin=(float(lo[0]), float(lo[1])),
+                centerline=np.c_[mid[keep], half[keep], half[keep]], width=float(width), length=float(length),
+                min_radius=float(min_radius), min_width=float(np.min(w_left + w_right)),
+                max_width=float(np.max(w_left + w_right)), trap_width=float(trap_w), trap_length=float(run_len),
+                trap_side=float(side), wall_offsets=np.c_[w_left, w_right])
+
+
+def trap_name(seed: int) -> str:
+    return f"Trap{seed}"
 
 
 # ---------------------------------------------------------------------------
@@ -595,28 +880,45 @@ TRAIN_MAPS = TRAIN_RACETRACKS + tuple(gen_name(s) for s in TRAIN_GEN_SEEDS)
 HELDOUT_MAPS = HELDOUT_RACETRACKS + tuple(gen_name(s) for s in HELDOUT_GEN_SEEDS)
 assert not set(TRAIN_MAPS) & set(HELDOUT_MAPS)
 
-# Lab-size tracks (generate_lab_track): the first valid seeds from 2000 (train),
-# 2500 (held-out: checkpoint selection) and 2900 (never-seen: final evaluation).
-LAB_TRAIN_SEEDS = (2004, 2015, 2019, 2021, 2022, 2027, 2036, 2037, 2038, 2042, 2046, 2056,
-                   2068, 2069, 2071, 2081, 2082, 2093, 2094, 2096, 2100, 2101, 2103, 2107)
-LAB_HELDOUT_SEEDS = (2506, 2511, 2524, 2526, 2529, 2533)
-LAB_UNSEEN_SEEDS = (2902, 2903, 2904, 2906, 2907, 2910)
+# Lab-size tracks (generate_lab_track, with pinched corners): the first valid seeds from 4000 (train),
+# 4500 (held-out: checkpoint selection) and 4900 (never-seen: final evaluation). (Seeds 2000+ were the
+# generator before corner pinching; new seeds keep their written maps from being reused.)
+LAB_TRAIN_SEEDS = (4005, 4010, 4015, 4025, 4036, 4037, 4040, 4046, 4048, 4049, 4050, 4051,
+                   4052, 4061, 4068, 4071, 4075, 4076, 4084, 4086, 4093, 4095, 4114, 4118)
+LAB_HELDOUT_SEEDS = (4501, 4503, 4506, 4507, 4511, 4516)
+LAB_UNSEEN_SEEDS = (4901, 4902, 4908, 4909, 4912, 4914)
 LAB_TRAIN_MAPS = tuple(lab_name(s) for s in LAB_TRAIN_SEEDS)
 LAB_HELDOUT_MAPS = tuple(lab_name(s) for s in LAB_HELDOUT_SEEDS)
 LAB_UNSEEN_MAPS = tuple(lab_name(s) for s in LAB_UNSEEN_SEEDS)
-# Room tracks (generate_room_track): first valid seeds from 3000 / 3500 / 3900.
-ROOM_TRAIN_SEEDS = (3012, 3025, 3027, 3036, 3039, 3041, 3045, 3053, 3076, 3077, 3081, 3086)
-ROOM_HELDOUT_SEEDS = (3500, 3501, 3513)
-ROOM_UNSEEN_SEEDS = (3919, 3937, 3946, 3955)
+# Room tracks (generate_room_track, tight turnarounds): first valid seeds from 5000 / 5500 / 5900
+# (3000+ were the version with wide turnarounds).
+ROOM_TRAIN_SEEDS = (5017, 5021, 5027, 5032, 5047, 5051, 5061, 5080, 5095, 5097, 5119, 5123)
+ROOM_HELDOUT_SEEDS = (5519, 5546, 5547)
+ROOM_UNSEEN_SEEDS = (5913, 5914, 5922, 5950)
 ROOM_TRAIN_MAPS = tuple(room_name(s) for s in ROOM_TRAIN_SEEDS)
 ROOM_HELDOUT_MAPS = tuple(room_name(s) for s in ROOM_HELDOUT_SEEDS)
 ROOM_UNSEEN_MAPS = tuple(room_name(s) for s in ROOM_UNSEEN_SEEDS)
-# Lab fine-tune (32 maps, 64 envs each): the last race's track both ways, room tracks, lab loops and a
-# few duct tracks (so wider corridors are not forgotten). Selection: held-out rooms, lab loops, a duct.
-LAB_FT_TRAIN_MAPS = (LAST_RACE_MAPS + ROOM_TRAIN_MAPS + LAB_TRAIN_MAPS[:14]
-                     + tuple(gen_name(s) for s in TRAIN_GEN_SEEDS[:4]))
-LAB_FT_HELDOUT_MAPS = ROOM_HELDOUT_MAPS + LAB_HELDOUT_MAPS[:4] + (gen_name(HELDOUT_GEN_SEEDS[0]),)
-LAB_EVAL_UNSEEN_MAPS = LAB_UNSEEN_MAPS + ROOM_UNSEEN_MAPS
+# Race-like tracks (generate_race_like_track) and speed-trap tracks (generate_trap_track): first valid
+# seeds from 6000 / 6500 / 6900 and 9000 / 9500 / 9900 (train / held-out / never-seen; trap seeds
+# 7000+ widened both walls, 8000+ one wall on a random side).
+RACE_LIKE_TRAIN_SEEDS = (6009, 6047, 6057, 6089, 6095, 6110, 6113, 6120, 6121, 6133, 6139,
+                         6140, 6145, 6153, 6183, 6193, 6196, 6231, 6244, 6255, 6258, 6262)
+RACE_LIKE_HELDOUT_SEEDS = (6596, 6599, 6600, 6607, 6629)
+RACE_LIKE_UNSEEN_SEEDS = (6922, 6935, 6940, 6971)
+TRAP_TRAIN_SEEDS = (9004, 9015, 9031, 9033, 9037, 9038, 9047, 9060)
+TRAP_HELDOUT_SEEDS = (9510, 9516, 9522)
+TRAP_UNSEEN_SEEDS = (9906, 9910)
+RACE_LIKE_TRAIN_MAPS = tuple(race_like_name(s) for s in RACE_LIKE_TRAIN_SEEDS)
+RACE_LIKE_HELDOUT_MAPS = tuple(race_like_name(s) for s in RACE_LIKE_HELDOUT_SEEDS)
+RACE_LIKE_UNSEEN_MAPS = tuple(race_like_name(s) for s in RACE_LIKE_UNSEEN_SEEDS)
+TRAP_TRAIN_MAPS = tuple(trap_name(s) for s in TRAP_TRAIN_SEEDS)
+TRAP_HELDOUT_MAPS = tuple(trap_name(s) for s in TRAP_HELDOUT_SEEDS)
+TRAP_UNSEEN_MAPS = tuple(trap_name(s) for s in TRAP_UNSEEN_SEEDS)
+# Lab fine-tune (32 maps, 64 envs each): the last race's track both ways, tracks like it, and
+# speed-trap loops. Selection: held-out race-like and trap tracks.
+LAB_FT_TRAIN_MAPS = LAST_RACE_MAPS + RACE_LIKE_TRAIN_MAPS + TRAP_TRAIN_MAPS
+LAB_FT_HELDOUT_MAPS = RACE_LIKE_HELDOUT_MAPS + TRAP_HELDOUT_MAPS
+LAB_EVAL_UNSEEN_MAPS = RACE_LIKE_UNSEEN_MAPS + TRAP_UNSEEN_MAPS
 assert not set(LAB_FT_TRAIN_MAPS) & set(LAB_FT_HELDOUT_MAPS + LAB_EVAL_UNSEEN_MAPS)
 assert not set(LAB_FT_HELDOUT_MAPS) & set(LAB_EVAL_UNSEEN_MAPS)
 assert len(LAB_FT_TRAIN_MAPS) == 32
@@ -645,7 +947,10 @@ def prepare_maps(map_dir: os.PathLike = DEFAULT_MAP_DIR, maps=TRAIN_MAPS + HELDO
                   for s in LAB_TRAIN_SEEDS + LAB_HELDOUT_SEEDS + LAB_UNSEEN_SEEDS})
     seeds.update({room_name(s): (generate_room_track, s)
                   for s in ROOM_TRAIN_SEEDS + ROOM_HELDOUT_SEEDS + ROOM_UNSEEN_SEEDS})
-    seeds.update({"LastRace": (last_race_track, False), "LastRaceRev": (last_race_track, True)})
+    seeds.update({"LastRace2": (last_race_track, False), "LastRace2Rev": (last_race_track, True)})
+    seeds.update({race_like_name(s): (generate_race_like_track, s)
+                  for s in RACE_LIKE_TRAIN_SEEDS + RACE_LIKE_HELDOUT_SEEDS + RACE_LIKE_UNSEEN_SEEDS})
+    seeds.update({trap_name(s): (generate_trap_track, s) for s in TRAP_TRAIN_SEEDS + TRAP_HELDOUT_SEEDS + TRAP_UNSEEN_SEEDS})
     for name in maps:
         if name in seeds:
             gen, seed = seeds[name]
@@ -787,13 +1092,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Prepare phase-1 maps.")
     parser.add_argument("command", choices=["prepare", "list"])
     parser.add_argument("--map-dir", default=str(DEFAULT_MAP_DIR))
-    parser.add_argument("--lab", action="store_true", help="also the lab-size, room and last-race tracks")
+    parser.add_argument("--lab", action="store_true", help="also the lab, room, last-race, race-like and trap tracks")
     args = parser.parse_args(argv)
     if args.command == "list":
         print(json.dumps(map_lists_config(), indent=2))
         return
     lab = (LAB_TRAIN_MAPS + LAB_HELDOUT_MAPS + LAB_UNSEEN_MAPS + ROOM_TRAIN_MAPS + ROOM_HELDOUT_MAPS
-           + ROOM_UNSEEN_MAPS + LAST_RACE_MAPS)
+           + ROOM_UNSEEN_MAPS + LAST_RACE_MAPS + LAB_FT_TRAIN_MAPS + LAB_FT_HELDOUT_MAPS + LAB_EVAL_UNSEEN_MAPS)
+    lab = tuple(dict.fromkeys(lab))
     maps = TRAIN_MAPS + HELDOUT_MAPS + (lab if args.lab else ())
     manifest = prepare_maps(args.map_dir, maps)
     out = pathlib.Path(args.map_dir) / "manifest.json"

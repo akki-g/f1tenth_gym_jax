@@ -249,7 +249,7 @@ def _line_lap(name, speed_scale, v_cap, steps=4000):
     from rl.domain_rand import make_param
 
     M.use_map_dir(M.DEFAULT_MAP_DIR)
-    M.prepare_maps(M.DEFAULT_MAP_DIR, (name,)) if name.startswith("Lab") else None
+    M.prepare_maps(M.DEFAULT_MAP_DIR, (name,)) if name.startswith(("Lab", "Room", "LastRace", "RaceLike", "Trap")) else None
     env = F110Env(1, make_param(name, randomize=False, produce_scans=False, max_steps=steps + 10))
     line = tuple(jnp.asarray(a) for a in RC.racing_line(name, float(env.track_length)))
     _, st = env.reset(jax.random.PRNGKey(0))
@@ -275,8 +275,8 @@ def test_racing_line_inside_corridor_and_shorter():
     from rl import race as RC
 
     M.use_map_dir(M.DEFAULT_MAP_DIR)
-    M.prepare_maps(M.DEFAULT_MAP_DIR, M.LAB_TRAIN_MAPS[:3])
-    for name in M.LAB_TRAIN_MAPS[:3] + ("Duct1002",):
+    M.prepare_maps(M.DEFAULT_MAP_DIR, M.LAB_FT_TRAIN_MAPS[:3] + M.TRAP_TRAIN_MAPS[:1])
+    for name in M.LAB_FT_TRAIN_MAPS[:3] + M.TRAP_TRAIN_MAPS[:1] + ("Duct1002",):
         d = M.DEFAULT_MAP_DIR / name
         cl = np.loadtxt(d / f"{name}_centerline.csv", delimiter=",", comments="#")
         s, ey = RC.racing_line(name, 10.0)
@@ -290,7 +290,7 @@ def test_racing_line_inside_corridor_and_shorter():
         assert np.abs(ey).max() > 0.05, name  # it does leave the centerline
 
 
-@pytest.mark.parametrize("name", ["Lab2004", "Lab2021", "Lab2506", "Duct1002"])
+@pytest.mark.parametrize("name", ["LastRace2", "LastRace2Rev", "RaceLike6009", "RaceLike6121", "Trap7002", "Duct1002"])
 def test_slow_and_normal_pursuit_lap_on_racing_line(name):
     collided, laps, v = _line_lap(name, 1.0, 1.0)  # slow car: 1 m/s cap
     assert not collided and laps >= 1.0 and 0.8 <= v <= 1.05, (name, collided, laps, v)

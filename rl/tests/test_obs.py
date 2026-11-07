@@ -50,7 +50,7 @@ def test_obs_constants_match_car_params():
     assert ob.CAR_SCAN_BEAMS == cp.CAR_SCAN_BEAMS and ob.BEAM_STRIDE == cp.BEAM_STRIDE == 4
     assert ob.FOV == cp.LIDAR_FOV and ob.MAX_RANGE == cp.MAX_RANGE
     assert ob.FRAME_STACK == cp.FRAME_STACK == 1 and ob.OBS_DIM == cp.OBS_DIM == 274
-    assert ob.V_CMD_MAX == cp.V_CMD_MAX and ob.S_MAX == cp.S_MAX
+    assert ob.V_CMD_MAX == cp.V_CMD_MAX and ob.S_MAX == min(-cp.S_MIN, cp.S_MAX)  # the policy's range: the smaller full lock
     np.testing.assert_array_equal(ob.CAR_BEAM_INDICES, np.arange(0, 1081, 4))
     assert ob.obs_dim(3) == 816 and ob.obs_dim(8) == 2171  # the MLP baselines
     # phase-1 layout still expressible: 109 beams, stride 10, stack 3 -> 330

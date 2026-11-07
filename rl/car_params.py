@@ -38,7 +38,10 @@ CLIP_SIGMAS = 2.0
 # ---------------------------------------------------------------------------
 # Vehicle: fixed parameters.
 # ---------------------------------------------------------------------------
-S_MIN, S_MAX = -0.4189, 0.4189  # steering limit, rad (gym; measure full lock)
+# steering limits, rad: the car's servo end stops (servo_min 0.15 / servo_max 0.95 with the
+# calibrated gain -0.9 and offset 0.552: (0.552 - 0.95) / 0.9, (0.552 - 0.15) / 0.9). The policy
+# commands +-obs.S_MAX (the smaller side) within them. (Phase 1/1c: +-0.4189.)
+S_MIN, S_MAX = -0.4422, 0.4467
 SV_MIN, SV_MAX = -3.2, 3.2  # steering rate, rad/s (gym, car max_servo_speed)
 V_MIN, V_MAX = -5.0, 20.0  # speed, m/s (gym; phase-1 decision)
 A_MAX = 9.51  # acceleration, m/s^2 (gym; phase-1 decision)
@@ -108,14 +111,15 @@ GRAVITY = 9.81  # m/s^2
 LAB_FRICTION = (1.1, 1.5)  # mu range (carpet); nominal is the midpoint
 LAB_MAX_DELAY_STEPS = 6  # action delay 0..6 policy steps (0-240 ms)
 LAB_MAX_LAPS = 5  # laps per training episode on 10-20 m tracks
+LAB_ACCEL = (5.5, 6.5)  # m/s^2, acceleration / braking limit (car laps, Nov 6), spread over the maps
 # Steering asymmetry (lab fine-tune; off by default). Full-lock semicircles on the car (Nov 6): ~1.50 m
 # across turning left, ~1.40 m turning right, i.e. radius 0.75 / 0.70 m, full lock atan(0.33 / r) =
 # 0.414 / 0.440 rad against the sim's 0.419: gains ~0.99 left, ~1.05 right. Per episode the executed
 # steering angle is scaled by a left-turn gain (positive angles) and a right-turn gain (negative
 # angles), +-5% around those; nominal episodes use the midpoints. The env's steering limits widen to
 # the largest gains (steer_overrides) so full right lock reaches ~0.46 rad.
-STEER_GAIN_LEFT = (0.94, 1.04)
-STEER_GAIN_RIGHT = (1.00, 1.10)
+STEER_GAIN_LEFT = (0.95, 1.05)  # with the calibrated -0.9 / 0.552: about as commanded,
+STEER_GAIN_RIGHT = (1.00, 1.10)  # right turns a little sharper (full-stick semicircles 1.40 vs 1.50 m)
 # Reset offset: the env starts agent 0 up to RESET_EY_MAX off the centerline.
 # make_param shrinks that on maps whose narrowest half-width leaves less than
 # RESET_CLEARANCE (half the car, the widest wall buffer, 5 cm) beside it;

@@ -73,6 +73,7 @@ class WrapperState:
     tip_right: chex.Array  # m/s^2, in right turns
     roll_count: chex.Array  # consecutive steps above the tipping limit
     steer_gain: chex.Array  # [2] this episode's executed-steering gain in left / right turns
+    direction: chex.Array  # +1 along the centerline, -1 the other way round (random_direction)
 
 
 def delay_action(buffer, k, command):
@@ -158,6 +159,7 @@ class Phase1Wrapper:
         max_delay: int = cp.MAX_DELAY_STEPS,
         rollover: bool = False,
         steer_asym: bool = False,
+        random_direction: bool = False,
     ):
         p = env.params
         if env.num_agents != self.NUM_AGENTS:
@@ -186,6 +188,7 @@ class Phase1Wrapper:
         self.stall_steps = int(stall_steps)
         self.rollover = bool(rollover)
         self.steer_asym = bool(steer_asym)
+        self.random_direction = bool(random_direction)
         # wall-buffer check on a window of the map around the car, sized to
         # cover the largest inflated footprint (same test as the env's
         # collision_map, without scanning every wall pixel of the map)
@@ -253,6 +256,10 @@ class Phase1Wrapper:
         tip_left, tip_right = tip_limits(jax.random.fold_in(k_ep, 7), self.randomize)  # own stream: the other draws keep theirs
         steer_gain = (steer_gains(jax.random.fold_in(k_ep, 13), self.randomize) if self.steer_asym
                       else jnp.ones(2, jnp.float32))
+        direction = jnp.float32(1.0)
+        if self.random_direction:  # half the episodes run the track the other way round
+            direction = jnp.where(jax.random.bernoulli(jax.random.fold_in(k_ep, 19)), -1.0, 1.0).astype(jnp.float32)
+            env_state = self.turn(env_state, direction, jax.random.fold_in(k_ep, 23))
         stack = ob.init_stack(self._sense(k_noise, env_state), self.frame_stack, xp=jnp)
         prev_action = ob.reset_action(xp=jnp)
         state = WrapperState(
@@ -273,9 +280,18 @@ class Phase1Wrapper:
             tip_right=tip_right,
             roll_count=jnp.zeros((), jnp.int32),
             steer_gain=steer_gain,
+            direction=direction,
         )
         speed = env_state.cartesian_states[0, 3]
         return ob.build_obs(stack, speed, prev_action, xp=jnp), state
+
+    def turn(self, env_state, direction, key):
+        """Face agent 0 the other way along the track when direction < 0 (and rescan)."""
+        flip = jnp.where(direction < 0, jnp.pi, 0.0)
+        cs = env_state.cartesian_states.at[0, 4].add(flip)
+        fs = env_state.frenet_states.at[0, 2].add(flip)
+        es = env_state.replace(cartesian_states=cs, last_cartesian_states=cs, frenet_states=fs, last_frenet_states=fs)
+        return self._env._scan(es, key)
 
     def reset_at(self, key: chex.PRNGKey, s: chex.Array) -> Tuple[chex.Array, WrapperState]:
         """Reset with the car on the centerline at arc length ``s``, heading
@@ -295,7 +311,7 @@ class Phase1Wrapper:
         )
         es = env._scan(es, k_scan)
         stack = ob.init_stack(self._sense(k_noise, es), self.frame_stack, xp=jnp)
-        state = state.replace(env_state=es, stack=stack)
+        state = state.replace(env_state=es, stack=stack, direction=jnp.float32(1.0))  # fixed starts run forward
         return ob.build_obs(stack, x[0, 3], state.prev_action, xp=jnp), state
 
     # ------------------------------------------------------------------- step
@@ -327,7 +343,7 @@ class Phase1Wrapper:
         collided = contact | buffer_hit
         # wrong way: heading error (wrapped to [-pi, pi]) beyond 90 deg
         wrong_way_count = jnp.where(
-            jnp.cos(env_state.frenet_states[0, 2]) < 0.0, state.wrong_way_count + 1, 0
+            jnp.cos(env_state.frenet_states[0, 2]) * state.direction < 0.0, state.wrong_way_count + 1, 0
         ).astype(jnp.int32)
         wrong_way = (self.wrong_way_steps > 0) & (wrong_way_count >= self.wrong_way_steps)
         stall_count = jnp.where(speed < cp.STALL_SPEED, state.stall_count + 1, 0).astype(jnp.int32)
@@ -337,7 +353,7 @@ class Phase1Wrapper:
         roll_count = jnp.where(jnp.abs(lat_accel) > tip, state.roll_count + 1, 0).astype(jnp.int32)
         rolled = self.rollover & (roll_count >= cp.ROLL_STEPS)
         failed = collided | wrong_way | stall | rolled
-        progress_m = rewards["agent_0"]
+        progress_m = rewards["agent_0"] * state.direction
         reward = step_reward(progress_m, self.track_length, action, state.prev_action, failed)
 
         ep_return = state.ep_return + reward

@@ -32,7 +32,7 @@ FOV = 4.7124  # rad
 MAX_RANGE = 10.0  # m
 FRAME_STACK = 1
 V_CMD_MAX = 8.0  # m/s
-S_MAX = 0.4189  # rad
+S_MAX = 0.4422  # rad, the policy's steering range (the car's smaller full lock; phase 1/1c: 0.4189)
 NUM_NON_SCAN = 3  # speed and the previous action, after the scans
 OBS_DIM = FRAME_STACK * NUM_BEAMS + NUM_NON_SCAN  # 274
 # Previous action after a reset / activation: stopped (speed 0), wheels straight.

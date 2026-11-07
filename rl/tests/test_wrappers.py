@@ -362,7 +362,7 @@ def test_steer_asymmetry_scales_left_and_right_turns(test_map_dir):
         for a_s, exp in ((0.5, exp_l), (-0.5, exp_r)):
             _, ws = env.reset_at(jax.random.PRNGKey(0), jnp.array(0.0))
             _, _, _, _, info = env.step(jax.random.PRNGKey(1), ws, jnp.array([-0.6, a_s]))
-            assert float(info["executed_command"][0]) == pytest.approx(a_s * cp.S_MAX * exp, rel=1e-5), (on, a_s)
+            assert float(info["executed_command"][0]) == pytest.approx(a_s * ob.S_MAX * exp, rel=1e-5), (on, a_s)
     # randomized: every episode draws its own pair, the right gain from the weaker range
     from rl.wrappers import steer_gains
     g = np.asarray(jax.vmap(lambda k: steer_gains(k, True))(jax.random.split(jax.random.PRNGKey(2), N_ENVS)))
@@ -371,15 +371,36 @@ def test_steer_asymmetry_scales_left_and_right_turns(test_map_dir):
     assert g[:, 1].mean() > g[:, 0].mean()  # the car turns tighter to the right at full lock
 
 
-def test_steer_asymmetry_full_right_lock_beyond_s_max():
-    """With the widened limits the env lets an amplified right lock through (the measured ~0.44 rad)."""
-    from rl.domain_rand import steer_overrides
-
-    env = F110Env(1, make_param("FineBox", randomize=False, produce_scans=False, **steer_overrides(True)))
-    assert env.params.s_min == pytest.approx(cp.S_MIN * cp.STEER_GAIN_RIGHT[1])
+def test_steering_limits_are_the_cars_servo_stops():
+    """The env clips steering at the car's servo end stops; the policy's range sits inside them."""
+    assert (cp.S_MIN, cp.S_MAX) == (-0.4422, 0.4467) and ob.S_MAX == pytest.approx(0.4422)
+    env = F110Env(1, make_param("FineBox", randomize=False, produce_scans=False))
+    assert (env.params.s_min, env.params.s_max) == (cp.S_MIN, cp.S_MAX)
     _, st = env.reset(jax.random.PRNGKey(0))
-    target = cp.S_MIN * sum(cp.STEER_GAIN_RIGHT) / 2
-    for _ in range(25):
-        _, st, _, _, _ = env.step_env(jax.random.PRNGKey(0), st, {"agent_0": jnp.array([target, 0.5])})
-    delta = float(st.cartesian_states[0, 2])
-    assert delta < cp.S_MIN - 0.01 and abs(delta - target) < 0.015  # past the old limit (the controller settles ~0.01 beyond)
+    for _ in range(25):  # an amplified right lock (gain 1.1) is clipped at the stop
+        _, st, _, _, _ = env.step_env(jax.random.PRNGKey(0), st, {"agent_0": jnp.array([-ob.S_MAX * 1.1, 0.5])})
+    assert float(st.cartesian_states[0, 2]) == pytest.approx(cp.S_MIN, abs=0.012)
+
+
+
+def test_random_direction_per_episode(test_map_dir):
+    """Half the episodes face the other way along the track; driving forward then still counts as
+    progress (no wrong-way end), and fixed-start resets run forward."""
+    env = _fine_env(stall_steps=0, random_direction=True)
+    keys = jax.random.split(jax.random.PRNGKey(3), N_ENVS)
+    _, ws = jax.vmap(env.reset)(keys)
+    d = np.asarray(ws.direction)
+    assert set(d.tolist()) == {-1.0, 1.0} and 0.3 < np.mean(d < 0) < 0.7
+    # the car faces against the track when reversed
+    head = np.cos(np.asarray(ws.env_state.frenet_states[:, 0, 2]))
+    assert np.all(head[d < 0] < -0.9) and np.all(head[d > 0] > 0.9)
+    i = int(np.argmax(d < 0))
+    w1 = jax.tree.map(lambda x: x[i], ws)
+    total = 0.0
+    for t in range(20):
+        _, w1, r, done, info = env.step(jax.random.PRNGKey(t), w1, jnp.array([-0.6, 0.0]))
+        assert not bool(info["wrong_way"]) and not bool(done)
+        total += float(r)
+    assert total > 0.0 and float(w1.ep_progress) > 0.0
+    _, wf = env.reset_at(jax.random.PRNGKey(0), jnp.array(0.0))
+    assert float(wf.direction) == 1.0

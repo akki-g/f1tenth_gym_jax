@@ -875,6 +875,18 @@ def _densify(poly, spacing):
     return np.vstack([np.linspace(a, b, k, endpoint=False) for a, b, k in zip(poly[:-1], poly[1:], n)] + [poly[-1:]])
 
 
+def _inside_polygon(poly, pts):
+    """Which of the points ``pts`` (N, 2) lie inside the closed polygon ``poly`` (M, 2), even-odd rule."""
+    x, y = pts[:, 0], pts[:, 1]
+    inside = np.zeros(len(pts), bool)
+    for (x1, y1), (x2, y2) in zip(poly, np.roll(poly, -1, axis=0)):
+        if y1 == y2:
+            continue
+        crosses = (y1 > y) != (y2 > y)
+        inside ^= crosses & (x < x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+    return inside
+
+
 def _loop_centerline(corridor, step=2, alpha=0.3):
     """A closed path around the island through the corridor's middle, as (row, col) grid coordinates:
     Dijkstra on the corridor grid (every ``step`` cells) with a cost that grows near the walls, from
@@ -927,7 +939,6 @@ def sketch_track(name: str, scale: float | None = None, max_width: float | None 
     per sketch pixel times the variant's scale, mirrored for some variants. Centerline: the path
     around the island through the corridor's middle, smoothed over ~1 m; stretches still wider than
     ``max_width`` capped (most of all sketch 4)."""
-    from matplotlib.path import Path
     from scipy import ndimage as ndi
     from scipy.spatial import cKDTree
 
@@ -948,7 +959,7 @@ def sketch_track(name: str, scale: float | None = None, max_width: float | None 
     gx, gy = np.meshgrid(lo[0] + (np.arange(w_px) + 0.5) * res, lo[1] + (np.arange(h_px) + 0.5) * res)
     P = np.c_[gx.ravel(), gy.ravel()]
     free = (cKDTree(pts).query(P)[0] > LAB_WALL / 2).reshape(h_px, w_px)
-    region = (Path(curves[0]).contains_points(P) & ~Path(curves[1]).contains_points(P)).reshape(h_px, w_px)
+    region = (_inside_polygon(curves[0], P) & ~_inside_polygon(curves[1], P)).reshape(h_px, w_px)
     labels, n = ndi.label(free & region)
     corridor = labels == 1 + np.argmax(np.bincount(labels.ravel(), minlength=n + 1)[1:])
     rc = _loop_centerline(corridor)

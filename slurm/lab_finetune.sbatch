@@ -1,8 +1,7 @@
 #!/bin/bash
 # Lab fine-tune: continue a phase-1c policy on lab-size tracks (10-20 m loops,
 # 0.9-2.0 m wide, uneven duct walls) with rollover, carpet friction (1.1-1.5)
-# and 0-240 ms action delay, on one H100. Probes the env's speed first, sizes
-# the env-step budget for the rest of the allocation, then trains.
+# and 0-240 ms action delay, on one H100, until the time limit.
 #
 #   sbatch --export=ALL,INIT_FROM=runs/phase1c/<run>/ckpt_01025.safetensors slurm/lab_finetune.sbatch
 #   options (env): ARCH (cnn_gru | mlp), FRAME_STACK (1 for cnn_gru, 3 for the MLP-3), LR (1e-4),
@@ -38,23 +37,10 @@ ARGS=(--arch "$ARCH" --frame-stack "$FRAME_STACK" --init-from "$INIT_FROM"
       --max-delay 6 --rollover true --friction-lo 1.1 --friction-hi 1.5 --max-laps 5
       --train-maps "${TRAIN[@]}" --heldout-maps "${HELDOUT[@]}" --wandb-mode offline)
 
-echo "=== throughput probe (2048 envs, ${#TRAIN[@]} maps)"
-PROBE="runs/probe_lab_${SLURM_JOB_ID:-local}"
-rm -rf "$PROBE"
-uv run --frozen python -m rl.train_ppo "${ARGS[@]}" --time-limit 240 --eval-every 100000 --checkpoint-every 100000 \
-  --runs-root "$PROBE" 2>&1 | grep -E "^update|setup|initialized|Error|error"
-BUDGET=$(python3 - "$TRAIN_SECONDS" "$PROBE" <<'PY'
-import glob, json, statistics, sys
-rows = [json.loads(l) for f in glob.glob(f"{sys.argv[2]}/*/metrics.jsonl") for l in open(f)]
-sps = statistics.median(r["sps"] for r in rows[1:]) if len(rows) > 1 else rows[0]["sps"]
-steps = 2048 * 256
-budget = int(sps * (float(sys.argv[1]) - 600) * 0.9) // steps * steps  # minus probe and compile time
-print(budget)
-print(f"lab sps {sps:.0f} -> budget {budget:.3g} env-steps ({budget // steps} updates)", file=sys.stderr)
-PY
-)
-rm -rf "$PROBE"
-echo "=== train ($BUDGET env-steps)"
-uv run --frozen python -m rl.train_ppo "${ARGS[@]}" --total-timesteps "$BUDGET" --time-limit "$((TRAIN_SECONDS - 600))" \
-  --runs-root runs/lab_ft
+# No throughput probe: compiling 32 maps takes longer than a short probe, which then sized the budget from
+# compile time (17-34 updates). Train until the time limit instead (a clean stop with a checkpoint), at a
+# constant learning rate, with a step budget it cannot reach.
+echo "=== train (until $((TRAIN_SECONDS - 300)) s)"
+uv run --frozen python -m rl.train_ppo "${ARGS[@]}" --anneal-lr false --total-timesteps 20000000000 \
+  --time-limit "$((TRAIN_SECONDS - 300))" --runs-root runs/lab_ft
 echo "done $(date -Is)"

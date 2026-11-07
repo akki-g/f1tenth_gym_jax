@@ -43,13 +43,14 @@ from f1tenth_gym_jax.envs.laser_models import _distance_at
 
 from . import car_params as cp
 from . import obs as ob
-from .wrappers import Phase1Wrapper, WrapperState, add_steer_offset, delay_action, step_reward
+from .wrappers import Phase1Wrapper, WrapperState, add_steer_offset, delay_action, lateral_accel, step_reward
 
 OPP_SOLO, OPP_SNAPSHOT, OPP_FTG, OPP_PURSUIT = 0, 1, 2, 3
 OPP_NAMES = ("solo", "snapshot", "follow_gap", "pursuit")
 OPP_MIX = (0.25, 0.40, 0.20, 0.15)
 SPEED_SCALE = (0.6, 1.0)
 STAGGER_M = (1.0, 5.0)
+SIDE_BY_SIDE_MIN_HALF = 0.6  # m: side-by-side starts only where the corridor is >= 1.2 m wide (else staggered)
 PARK_XY = (1.0e4, 1.0e4)  # far beyond max range of any scan, off every map
 OVERTAKE_REWARD = 0.5
 FINISH_REWARD = 2.0
@@ -85,7 +86,10 @@ def follow_the_gap(ranges: chex.Array, speed_scale, fov_deg=180.0, bubble_deg=15
     idx = jnp.arange(r.shape[0])
     r = jnp.where(jnp.abs(idx - jnp.argmin(r)) <= int(round(bubble_deg / deg)), 0.0, r)  # safety bubble
     free = r > 0.0
-    run = jax.lax.scan(lambda carry, f: ((carry + 1) * f, (carry + 1) * f), 0, free.astype(jnp.int32))[1]
+    # length of the free run ending at each beam (0 on blocked beams): index minus the last blocked index
+    # at or before it (a running max: parallel, unlike a scan over the beams)
+    last_blocked = jax.lax.cummax(jnp.where(free, -1, idx), axis=0)
+    run = jnp.where(free, idx - last_blocked, 0)
     end = jnp.argmax(run)  # longest free run ends here
     length = run[end]
     start = end - length + 1
@@ -184,16 +188,21 @@ class RaceWrapper(Phase1Wrapper):
         parked = jnp.zeros(2)
         h, prev = rs.opp_h, rs.opp_prev_action
         if opp_params is not None and self.snapshot_model is not None:
-            params = jax.tree.map(lambda x: x[rs.opp_snapshot], opp_params["params"])
-            norm = jax.tree.map(lambda x: x[rs.opp_snapshot], opp_params["normalizer"])
             # the snapshot is an ego policy (race format): zeros in its critic-only slot
             o = self._build_obs(ob.normalize_scan(es.scans[1], xp=jnp)[None], car[3], prev, jnp.zeros(PRIV_DIM))
             h_in = jnp.where(rs.opp_first, 0.0, h)
-            h_new, mean, _, _ = self.snapshot_model.apply(params, h_in[None], norm(o[None]))
-            a = jnp.tanh(mean[0])
+
+            def member(params, norm):
+                h_new, mean, _, _ = self.snapshot_model.apply(params, h_in[None], norm(o[None]))
+                return h_new[0], mean[0]
+
+            # Run every pool member and keep this env's: the weights stay shared across envs. (Indexing the
+            # pool per env first made every env gather its own copy of the weights each step, 2048 copies.)
+            hs, means = jax.vmap(member)(opp_params["params"], opp_params["normalizer"])
+            a = jnp.tanh(means[rs.opp_snapshot])
             speed, steer = ob.action_to_command(a, xp=jnp)
             snapshot = jnp.array([steer, speed])
-            h = h_new[0]
+            h = hs[rs.opp_snapshot]
         else:
             snapshot = pursuit  # no pool yet
             a = ob.command_to_action(pursuit[1], pursuit[0], xp=jnp)
@@ -219,7 +228,9 @@ class RaceWrapper(Phase1Wrapper):
         if self.fixed_side_by_side is not None:
             side_by_side = jnp.array(bool(self.fixed_side_by_side))
         sign = jnp.where(jax.random.bernoulli(k_side, 0.5), 1.0, -1.0)
-        q = self.local_half_width(s0) / 2  # a quarter of the local width
+        half_w = self.local_half_width(s0)
+        side_by_side = side_by_side & (half_w >= SIDE_BY_SIDE_MIN_HALF)  # two cars need room: else staggered
+        q = half_w / 2  # a quarter of the local width
         gap = jax.random.uniform(k_gap, minval=STAGGER_M[0], maxval=STAGGER_M[1])
         ey = jax.random.uniform(k_ey, (2,), minval=-0.25 * q, maxval=0.25 * q)
         s_opp = jnp.where(side_by_side, s0, s0 + gap)
@@ -300,7 +311,11 @@ class RaceWrapper(Phase1Wrapper):
         wrong_way = (self.wrong_way_steps > 0) & (wrong_way_count >= self.wrong_way_steps)
         stall_count = jnp.where(speed < cp.STALL_SPEED, st.stall_count + 1, 0).astype(jnp.int32)
         stall = (self.stall_steps > 0) & (stall_count >= self.stall_steps)
-        failed = collided | wrong_way | stall
+        lat_accel = lateral_accel(es)  # the ego tips like the solo car; the opponent is not checked
+        tip = jnp.where(lat_accel >= 0.0, st.tip_left, st.tip_right)
+        roll_count = jnp.where(jnp.abs(lat_accel) > tip, st.roll_count + 1, 0).astype(jnp.int32)
+        rolled = self.rollover & (roll_count >= cp.ROLL_STEPS)
+        failed = collided | wrong_way | stall | rolled
         progress_m = rewards["agent_0"]
         reward = step_reward(progress_m, self.track_length, action, st.prev_action, failed)
 
@@ -325,7 +340,8 @@ class RaceWrapper(Phase1Wrapper):
 
         ego = st.replace(env_state=es, delay_buffer=delay_buffer, stack=stack, prev_action=action,
                          ep_return=ep_return, ep_length=ep_length, ep_speed_sum=st.ep_speed_sum + speed,
-                         ep_progress=ep_progress, wrong_way_count=wrong_way_count, stall_count=stall_count)
+                         ep_progress=ep_progress, wrong_way_count=wrong_way_count, stall_count=stall_count,
+                         roll_count=roll_count)
         cont = rs.replace(ego=ego, opp_h=opp_h, opp_first=jnp.array(False), opp_prev_action=opp_prev,
                           opp_progress=opp_progress, position=new_pos,
                           overtakes=rs.overtakes + passed.astype(jnp.int32) - was_passed.astype(jnp.int32))
@@ -346,8 +362,8 @@ class RaceWrapper(Phase1Wrapper):
             "wall_buffer": buffer_hit & ~contact,
             "wrong_way": wrong_way,
             "stall": stall,
-            "rollover": jnp.zeros((), bool),  # phase 2 does not model tipping
-            "lat_accel": jnp.zeros((), jnp.float32),
+            "rollover": rolled,
+            "lat_accel": lat_accel,
             "margin": st.margin,
             "timeout": timeout,
             "speed": speed,

@@ -424,6 +424,150 @@ def lab_name(seed: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Room tracks: a duct wall around a room with an island inside (the race layout)
+# ---------------------------------------------------------------------------
+ROOM_SIZE = ((5.0, 11.0), (4.0, 8.0))  # m, room (x, y) extent of the outer wall's inner face
+ROOM_CORNER = (0.8, 2.0)  # m, corner radius
+ROOM_GAP = ((0.9, 2.5), (0.9, 3.0))  # m, wall-face gap beside the island: left/right (x), front/back (y)
+ISLAND_MIN = (1.5, 0.4)  # m, smallest island length and width
+ROOM_MIN_GAP = 0.9  # m, narrowest corridor along a ray from the island centre (wall face to wall face)
+ROOM_MIN_WIDTH = 0.85  # m, narrowest corridor in the rendered map (twice the clearance on the centerline)
+ROOM_LENGTH = (12.0, 34.0)  # m, centerline length
+ROOM_MIN_RADIUS = 0.8  # m
+
+
+def _periodic_noise(rng, th, amp, waves=(2, 6)):
+    out = np.zeros_like(th)
+    for k in range(waves[0], waves[1] + 1):
+        out += rng.uniform(0, amp) / k * np.cos(k * th + rng.uniform(0, 2 * np.pi))
+    return out
+
+
+def _dent(th, center, width, depth):
+    d = np.angle(np.exp(1j * (th - center)))
+    return depth * np.exp(-0.5 * (d / width) ** 2)
+
+
+def build_room_track(room_r, island_r, centre, reverse=False):
+    """Render a room track from the outer wall's inner face and the island's outer face,
+    both as radii over angle (720 samples) around ``centre`` (inside the island).
+    Corridor centerline: halfway between the faces along each ray, smoothed; its
+    half-width: the clearance to the nearest wall in the rendered map. Returns the
+    generate_*_track dict, or None if the corridor is too narrow or too tight."""
+    from scipy.ndimage import distance_transform_edt
+
+    th = np.linspace(0.0, 2 * np.pi, len(room_r), endpoint=False)
+    if np.min(room_r - island_r) < ROOM_MIN_GAP:
+        return None
+    mid_r = (room_r + island_r) / 2
+    xy = centre + np.c_[mid_r * np.cos(th), mid_r * np.sin(th)]
+    xy = _smooth_closed(_resample_closed(xy, 0.05), 9)
+    if reverse:
+        xy = xy[::-1]
+    xy = _resample_closed(xy, 0.1)
+    length = float(np.sum(np.hypot(*np.diff(np.vstack([xy, xy[:1]]), axis=0).T)))
+    min_radius = 1.0 / np.max(np.abs(_curvature_closed(_smooth_closed(xy, 3))))
+
+    res = GEN_RESOLUTION
+    reach = room_r.max() + LAB_WALL + GEN_MARGIN
+    lo, hi = centre - reach, centre + reach
+    w_px, h_px = np.ceil((hi - lo) / res).astype(int)
+    gx, gy = np.meshgrid(lo[0] + (np.arange(w_px) + 0.5) * res, lo[1] + (np.arange(h_px) + 0.5) * res)
+    rho = np.hypot(gx - centre[0], gy - centre[1])
+    phi = np.mod(np.arctan2(gy - centre[1], gx - centre[0]), 2 * np.pi)
+    r_room = np.interp(phi, th, room_r, period=2 * np.pi)
+    r_isl = np.interp(phi, th, island_r, period=2 * np.pi)
+    # radial bands approximate the walls' 0.30 m thickness (the faces are near-convex)
+    wall = ((rho >= r_room) & (rho <= r_room + LAB_WALL)) | ((rho <= r_isl) & (rho >= r_isl - LAB_WALL))
+    free = ~wall
+    corridor = (rho < r_room) & (rho > r_isl)
+    clear = distance_transform_edt(corridor) * res  # distance to the nearest wall face, m
+    ij = np.clip(np.round((xy - lo) / res - 0.5).astype(int), 0, [w_px - 1, h_px - 1])
+    half = clear[ij[:, 1], ij[:, 0]]
+    k = _curvature_closed(xy)
+    start = int(np.argmin(np.abs(_smooth_closed(np.c_[k, k], 15)[:, 0])))
+    xy, half = np.roll(xy, -start, axis=0), np.roll(half, -start)
+    return dict(free=free, resolution=res, origin=(float(lo[0]), float(lo[1])),
+                centerline=np.c_[xy, half, half], width=float(2 * np.median(half)), length=length,
+                min_radius=float(min_radius), min_width=float(2 * half.min()), max_width=float(2 * half.max()))
+
+
+def generate_room_track(seed: int):
+    """One room track from ``seed``, or None if it fails the checks: a rounded-rectangle
+    room (5-11 x 4-8 m) whose duct wall wanders and may dent inward, around an
+    off-centre elongated island (also wandering, maybe with a bulge), so the corridor
+    runs from narrow passages to wide open areas; clockwise or not."""
+    rng = np.random.RandomState(seed)
+    th = np.linspace(0.0, 2 * np.pi, 720, endpoint=False)
+    W, H = rng.uniform(*ROOM_SIZE[0]), rng.uniform(*ROOM_SIZE[1])
+    if not 1.0 <= W / H <= 2.2:
+        return None
+    corner = min(rng.uniform(*ROOM_CORNER), H / 2 - 0.1)
+    # island: a superellipse filling the room minus a gap to each wall (so the corridor runs from
+    # ~0.9 m passages to ~3 m open areas), slightly rotated; its centre is the polar origin
+    gl, gr = rng.uniform(*ROOM_GAP[0], size=2)
+    gb, gt = rng.uniform(*ROOM_GAP[1], size=2)
+    Li, Wi = W - gl - gr, H - gb - gt
+    if Li < ISLAND_MIN[0] or Wi < ISLAND_MIN[1]:
+        return None
+    Wi = min(Wi, rng.uniform(ISLAND_MIN[1], max(Wi, ISLAND_MIN[1] + 1e-3)))  # often thinner than the room allows
+    ang = rng.uniform(-0.35, 0.35)
+    off = np.array([(gl - gr) / 2, (gb - gt) / 2])
+    p = rng.uniform(2.0, 4.0)
+    a = th - ang
+    island = (np.abs(np.cos(a) / (Li / 2)) ** p + np.abs(np.sin(a) / (Wi / 2)) ** p) ** (-1.0 / p)
+    island *= 1.0 + _periodic_noise(rng, th, 0.08)
+    if rng.rand() < 0.5:  # a bulge on one side
+        island += _dent(th, rng.uniform(0, 2 * np.pi), rng.uniform(0.2, 0.5), rng.uniform(0.2, 0.6))
+    # room face, seen from the island centre: rays from (off) to the rounded rectangle centred at 0
+    d = np.c_[np.cos(th), np.sin(th)]
+    t = np.linspace(0.0, 20.0, 4001)[:, None, None]
+    pts = off[None, None] + t * d[None]  # [steps, 720, 2]
+    qx = np.maximum(np.abs(pts[..., 0]) - (W / 2 - corner), 0.0)
+    qy = np.maximum(np.abs(pts[..., 1]) - (H / 2 - corner), 0.0)
+    inside = (np.abs(pts[..., 0]) <= W / 2) & (np.abs(pts[..., 1]) <= H / 2) & (np.hypot(qx, qy) <= corner)
+    room = t[np.argmax(~inside, axis=0), 0, 0]
+    room += _periodic_noise(rng, th, 0.25)
+    if rng.rand() < 0.5:  # a dent pushed in from the outer wall
+        room -= _dent(th, rng.uniform(0, 2 * np.pi), rng.uniform(0.15, 0.4), rng.uniform(0.3, 0.9))
+    g = build_room_track(room, island, off, reverse=rng.rand() < 0.5)
+    if g is None or not ROOM_LENGTH[0] <= g["length"] <= ROOM_LENGTH[1] or g["min_radius"] < ROOM_MIN_RADIUS:
+        return None
+    if g["min_width"] < ROOM_MIN_WIDTH:  # walls oblique to the rays can pinch the corridor below the gap
+        return None
+    return g
+
+
+def room_name(seed: int) -> str:
+    return f"Room{seed}"
+
+
+def last_race_track(reverse: bool = False):
+    """The previous race's track, estimated from one oblique photo (IMG_6226): a ~10 x 7 m
+    room, an island angled from the back-left toward the middle, leaving a ~0.9 m passage
+    along the back wall, ~1.8 m on the left, ~2 m on the right and a ~3 m open area in
+    front; the back wall dents in near the middle. Approximate: no measurements."""
+    th = np.linspace(0.0, 2 * np.pi, 720, endpoint=False)
+    W, H, corner = 10.0, 7.0, 1.6
+    centre = np.array([-0.6, 0.9])  # island centre, room centred at 0 (x right, y toward the back wall)
+    Li, Wi, ang, p = 5.6, 1.1, np.radians(-18.0), 2.6
+    a = th - ang
+    island = (np.abs(np.cos(a) / (Li / 2)) ** p + np.abs(np.sin(a) / (Wi / 2)) ** p) ** (-1.0 / p)
+    d = np.c_[np.cos(th), np.sin(th)]
+    t = np.linspace(0.0, 20.0, 4001)[:, None, None]
+    pts = centre[None, None] + t * d[None]
+    qx = np.maximum(np.abs(pts[..., 0]) - (W / 2 - corner), 0.0)
+    qy = np.maximum(np.abs(pts[..., 1]) - (H / 2 - corner), 0.0)
+    inside = (np.abs(pts[..., 0]) <= W / 2) & (np.abs(pts[..., 1]) <= H / 2) & (np.hypot(qx, qy) <= corner)
+    room = t[np.argmax(~inside, axis=0), 0, 0]
+    room -= _dent(th, np.radians(95.0), 0.35, 0.5)  # the back wall's inward step near the middle
+    return build_room_track(room, island, centre, reverse=reverse)
+
+
+LAST_RACE_MAPS = ("LastRace", "LastRaceRev")
+
+
+# ---------------------------------------------------------------------------
 # Fixed train / held-out lists (spec 4.3). Held-out maps are never trained on.
 # ---------------------------------------------------------------------------
 # Generator seeds: the first 11 seeds >= 1000 that pass generate_duct_track's
@@ -460,11 +604,22 @@ LAB_UNSEEN_SEEDS = (2902, 2903, 2904, 2906, 2907, 2910)
 LAB_TRAIN_MAPS = tuple(lab_name(s) for s in LAB_TRAIN_SEEDS)
 LAB_HELDOUT_MAPS = tuple(lab_name(s) for s in LAB_HELDOUT_SEEDS)
 LAB_UNSEEN_MAPS = tuple(lab_name(s) for s in LAB_UNSEEN_SEEDS)
-# Lab fine-tune: lab tracks plus the duct tracks (kept so wider corridors are not forgotten)
-LAB_FT_TRAIN_MAPS = LAB_TRAIN_MAPS + tuple(gen_name(s) for s in TRAIN_GEN_SEEDS)
-LAB_FT_HELDOUT_MAPS = LAB_HELDOUT_MAPS + tuple(gen_name(s) for s in HELDOUT_GEN_SEEDS[:2])
-assert not set(LAB_FT_TRAIN_MAPS) & set(LAB_FT_HELDOUT_MAPS + LAB_UNSEEN_MAPS)
-assert not set(LAB_FT_HELDOUT_MAPS) & set(LAB_UNSEEN_MAPS)
+# Room tracks (generate_room_track): first valid seeds from 3000 / 3500 / 3900.
+ROOM_TRAIN_SEEDS = (3012, 3025, 3027, 3036, 3039, 3041, 3045, 3053, 3076, 3077, 3081, 3086)
+ROOM_HELDOUT_SEEDS = (3500, 3501, 3513)
+ROOM_UNSEEN_SEEDS = (3919, 3937, 3946, 3955)
+ROOM_TRAIN_MAPS = tuple(room_name(s) for s in ROOM_TRAIN_SEEDS)
+ROOM_HELDOUT_MAPS = tuple(room_name(s) for s in ROOM_HELDOUT_SEEDS)
+ROOM_UNSEEN_MAPS = tuple(room_name(s) for s in ROOM_UNSEEN_SEEDS)
+# Lab fine-tune (32 maps, 64 envs each): the last race's track both ways, room tracks, lab loops and a
+# few duct tracks (so wider corridors are not forgotten). Selection: held-out rooms, lab loops, a duct.
+LAB_FT_TRAIN_MAPS = (LAST_RACE_MAPS + ROOM_TRAIN_MAPS + LAB_TRAIN_MAPS[:14]
+                     + tuple(gen_name(s) for s in TRAIN_GEN_SEEDS[:4]))
+LAB_FT_HELDOUT_MAPS = ROOM_HELDOUT_MAPS + LAB_HELDOUT_MAPS[:4] + (gen_name(HELDOUT_GEN_SEEDS[0]),)
+LAB_EVAL_UNSEEN_MAPS = LAB_UNSEEN_MAPS + ROOM_UNSEEN_MAPS
+assert not set(LAB_FT_TRAIN_MAPS) & set(LAB_FT_HELDOUT_MAPS + LAB_EVAL_UNSEEN_MAPS)
+assert not set(LAB_FT_HELDOUT_MAPS) & set(LAB_EVAL_UNSEEN_MAPS)
+assert len(LAB_FT_TRAIN_MAPS) == 32
 
 DEFAULT_MAP_DIR = pathlib.Path(__file__).resolve().parent / "maps"
 
@@ -488,6 +643,9 @@ def prepare_maps(map_dir: os.PathLike = DEFAULT_MAP_DIR, maps=TRAIN_MAPS + HELDO
     seeds = {gen_name(s): (generate_duct_track, s) for s in TRAIN_GEN_SEEDS + HELDOUT_GEN_SEEDS}
     seeds.update({lab_name(s): (generate_lab_track, s)
                   for s in LAB_TRAIN_SEEDS + LAB_HELDOUT_SEEDS + LAB_UNSEEN_SEEDS})
+    seeds.update({room_name(s): (generate_room_track, s)
+                  for s in ROOM_TRAIN_SEEDS + ROOM_HELDOUT_SEEDS + ROOM_UNSEEN_SEEDS})
+    seeds.update({"LastRace": (last_race_track, False), "LastRaceRev": (last_race_track, True)})
     for name in maps:
         if name in seeds:
             gen, seed = seeds[name]
@@ -629,12 +787,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Prepare phase-1 maps.")
     parser.add_argument("command", choices=["prepare", "list"])
     parser.add_argument("--map-dir", default=str(DEFAULT_MAP_DIR))
-    parser.add_argument("--lab", action="store_true", help="also the lab-size tracks (train, held-out, never-seen)")
+    parser.add_argument("--lab", action="store_true", help="also the lab-size, room and last-race tracks")
     args = parser.parse_args(argv)
     if args.command == "list":
         print(json.dumps(map_lists_config(), indent=2))
         return
-    maps = TRAIN_MAPS + HELDOUT_MAPS + ((LAB_TRAIN_MAPS + LAB_HELDOUT_MAPS + LAB_UNSEEN_MAPS) if args.lab else ())
+    lab = (LAB_TRAIN_MAPS + LAB_HELDOUT_MAPS + LAB_UNSEEN_MAPS + ROOM_TRAIN_MAPS + ROOM_HELDOUT_MAPS
+           + ROOM_UNSEEN_MAPS + LAST_RACE_MAPS)
+    maps = TRAIN_MAPS + HELDOUT_MAPS + (lab if args.lab else ())
     manifest = prepare_maps(args.map_dir, maps)
     out = pathlib.Path(args.map_dir) / "manifest.json"
     out.write_text(json.dumps({**map_lists_config(), **manifest}, indent=2))

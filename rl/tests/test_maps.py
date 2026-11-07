@@ -213,3 +213,43 @@ def test_lab_multimap_env_with_rollover_and_friction(lab_prepared):
     assert delays.max() <= 6
     obs, states, r, d, info = jax.jit(env.step)(jax.random.PRNGKey(1), states, jnp.tile(jnp.array([-0.5, 0.0]), (16, 1)))
     assert "rollover" in info and info["lat_accel"].shape == (16,)
+
+
+# ---------------------------------------------------------------------------
+# Room tracks and the last race's track
+# ---------------------------------------------------------------------------
+ALL_ROOM = M.ROOM_TRAIN_SEEDS + M.ROOM_HELDOUT_SEEDS + M.ROOM_UNSEEN_SEEDS
+
+
+@pytest.fixture(scope="module")
+def room_prepared():
+    map_dir = M.use_map_dir(M.DEFAULT_MAP_DIR)
+    M.prepare_maps(map_dir, M.ROOM_TRAIN_MAPS + M.ROOM_HELDOUT_MAPS + M.ROOM_UNSEEN_MAPS + M.LAST_RACE_MAPS)
+    return map_dir
+
+
+def test_room_and_fine_tune_lists():
+    assert len(M.LAB_FT_TRAIN_MAPS) == 32 and len(set(M.LAB_FT_TRAIN_MAPS)) == 32
+    assert set(M.LAST_RACE_MAPS) <= set(M.LAB_FT_TRAIN_MAPS)
+    assert not set(M.LAB_FT_TRAIN_MAPS) & set(M.LAB_FT_HELDOUT_MAPS + M.LAB_EVAL_UNSEEN_MAPS)
+
+
+@pytest.mark.parametrize("name", [M.room_name(s) for s in ALL_ROOM] + list(M.LAST_RACE_MAPS))
+def test_room_track_in_spec_and_drivable(room_prepared, name):
+    if name.startswith("Room"):
+        g = M.generate_room_track(int(name[4:]))
+        assert g is not None and M.ROOM_LENGTH[0] <= g["length"] <= M.ROOM_LENGTH[1]
+        assert g["min_width"] >= M.ROOM_MIN_WIDTH and g["min_radius"] >= M.ROOM_MIN_RADIUS
+    else:
+        g = M.last_race_track(reverse=name.endswith("Rev"))
+    img = np.asarray(Image.open(room_prepared / name / f"{name}.png"))[::-1] > 127
+    np.testing.assert_array_equal(img, g["free"])
+    assert g["centerline"][:, 2].min() >= 0.4  # the car (0.155 m half-width) fits everywhere on the centerline
+    collided, progress, steps = _pure_pursuit_lap(name, speed=1.5, lookahead=0.6)
+    assert not collided and progress >= 1.0, (name, collided, progress, steps)
+
+
+def test_last_race_both_directions():
+    fwd, rev = M.last_race_track(), M.last_race_track(reverse=True)
+    turn = lambda g: np.sign(np.sum(M._curvature_closed(g["centerline"][:, :2])))  # noqa: E731
+    assert turn(fwd) == -turn(rev) and np.array_equal(fwd["free"], rev["free"])

@@ -66,6 +66,14 @@ def friction_overrides(friction, randomize: bool) -> dict:
     return out
 
 
+def steer_overrides(steer_asym: bool) -> dict:
+    """make_param overrides that widen the env's steering limits to the largest steering gains,
+    so an amplified full lock is not clipped back to S_MAX. Off: no overrides."""
+    if not steer_asym:
+        return {}
+    return {"s_min": cp.S_MIN * cp.STEER_GAIN_RIGHT[1], "s_max": cp.S_MAX * cp.STEER_GAIN_LEFT[1]}
+
+
 # Param.max_num_laps used to switch the env's own lap termination off.
 ENV_LAPS_OFF = 1_000_000
 

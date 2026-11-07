@@ -138,7 +138,7 @@ def main(argv=None):
     r.add_argument("--out-dir", type=pathlib.Path, default=None)
     r.add_argument("--suite", choices=sorted(SUITES), default="phase1c")
     r.add_argument("--lab-physics", action="store_true",
-                   help="rollover, carpet friction, 0-240 ms delay, weaker right-turn steering")
+                   help="rollover, carpet friction, 0-240 ms delay, measured left/right steering")
     args = parser.parse_args(argv)
 
     if args.cmd == "prepare":

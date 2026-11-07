@@ -355,7 +355,7 @@ def test_rollover_threshold_by_turn_direction(test_map_dir, monkeypatch, a_lat, 
 
 
 def test_steer_asymmetry_scales_left_and_right_turns(test_map_dir):
-    """Nominal gains are the midpoints: left turns x0.95, right turns x0.85; off: x1."""
+    """Nominal gains are the midpoints (measured: left ~0.99, right ~1.05); off: x1."""
     gl, gr = sum(cp.STEER_GAIN_LEFT) / 2, sum(cp.STEER_GAIN_RIGHT) / 2
     for on, (exp_l, exp_r) in ((True, (gl, gr)), (False, (1.0, 1.0))):
         env = _fine_env(stall_steps=0, wrong_way_steps=0, steer_asym=on)
@@ -368,4 +368,18 @@ def test_steer_asymmetry_scales_left_and_right_turns(test_map_dir):
     g = np.asarray(jax.vmap(lambda k: steer_gains(k, True))(jax.random.split(jax.random.PRNGKey(2), N_ENVS)))
     assert g[:, 0].min() >= cp.STEER_GAIN_LEFT[0] and g[:, 0].max() <= cp.STEER_GAIN_LEFT[1]
     assert g[:, 1].min() >= cp.STEER_GAIN_RIGHT[0] and g[:, 1].max() <= cp.STEER_GAIN_RIGHT[1]
-    assert g[:, 1].mean() < g[:, 0].mean()
+    assert g[:, 1].mean() > g[:, 0].mean()  # the car turns tighter to the right at full lock
+
+
+def test_steer_asymmetry_full_right_lock_beyond_s_max():
+    """With the widened limits the env lets an amplified right lock through (the measured ~0.44 rad)."""
+    from rl.domain_rand import steer_overrides
+
+    env = F110Env(1, make_param("FineBox", randomize=False, produce_scans=False, **steer_overrides(True)))
+    assert env.params.s_min == pytest.approx(cp.S_MIN * cp.STEER_GAIN_RIGHT[1])
+    _, st = env.reset(jax.random.PRNGKey(0))
+    target = cp.S_MIN * sum(cp.STEER_GAIN_RIGHT) / 2
+    for _ in range(25):
+        _, st, _, _, _ = env.step_env(jax.random.PRNGKey(0), st, {"agent_0": jnp.array([target, 0.5])})
+    delta = float(st.cartesian_states[0, 2])
+    assert delta < cp.S_MIN - 0.01 and abs(delta - target) < 0.015  # past the old limit (the controller settles ~0.01 beyond)

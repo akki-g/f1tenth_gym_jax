@@ -49,7 +49,7 @@ def make_evaluator(
     evaluation uses the margin without noise."""
     from f1tenth_gym_jax.envs import F110Env
 
-    from .domain_rand import friction_overrides, make_param
+    from .domain_rand import friction_overrides, make_param, steer_overrides
     from .wrappers import Phase1Wrapper
 
     model_cfg = model_cfg or model_cfg_from({})
@@ -58,7 +58,8 @@ def make_evaluator(
     wrappers = [
         Phase1Wrapper(
             F110Env(1, make_param(m, randomize=randomize, max_steps=max_steps, num_beams=model_cfg["num_beams"],
-                                  **friction_overrides(friction, randomize))),
+                                  **friction_overrides(friction, randomize),
+                                  **steer_overrides(bool((wrapper_kwargs or {}).get("steer_asym", False))))),
             randomize,
             max_laps=1,
             **wk,

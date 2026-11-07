@@ -40,7 +40,7 @@ from safetensors.numpy import load_file, save_file  # noqa: E402
 
 from . import car_params as cp  # noqa: E402
 from . import maps as M  # noqa: E402
-from .domain_rand import friction_overrides  # noqa: E402
+from .domain_rand import friction_overrides, steer_overrides  # noqa: E402
 from .networks import (  # noqa: E402
     MODEL_KEYS,
     NORM_SLICE,
@@ -108,7 +108,7 @@ class Config:
     wrong_way_steps: int = cp.WRONG_WAY_STEPS
     stall_steps: int = cp.STALL_STEPS
     rollover: bool = False  # end episodes on tipping (car_params TIP_*; lab fine-tune)
-    steer_asym: bool = False  # weaker right-turn steering, per episode (car_params STEER_GAIN_*; lab fine-tune)
+    steer_asym: bool = False  # left/right steering gains per episode (car_params STEER_GAIN_*; lab fine-tune)
     friction_lo: float = 0.0  # friction_hi > 0: mu range [lo, hi] replaces car_params' (lab: 1.1-1.5)
     friction_hi: float = 0.0
     max_laps: int = cp.MAX_LAPS  # laps per training episode (evaluation always uses 1)
@@ -694,7 +694,8 @@ def train(config: Config) -> pathlib.Path:
     race = dict(opponents=True, gru_dim=config.gru_dim, snapshot_model=race_model(config)) if config.race else None
     env = M.MultiMapEnv(config.train_maps, config.num_envs, randomize=config.randomize,
                         wrapper_kwargs={**config.wrapper_kwargs(), "max_laps": config.max_laps}, race=race,
-                        num_beams=config.num_beams, **friction_overrides(config.friction(), config.randomize))
+                        num_beams=config.num_beams, **friction_overrides(config.friction(), config.randomize),
+                        **steer_overrides(config.steer_asym))
     init, update, _, internals = make_trainer(config, env)
     runner = jax.jit(init)(jax.random.PRNGKey(config.seed))
     latest = run_dir / "latest.safetensors"

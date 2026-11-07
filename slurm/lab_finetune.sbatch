@@ -1,7 +1,7 @@
 #!/bin/bash
 # Lab fine-tune: continue a phase-1c policy on lab-size tracks (10-20 m loops,
 # 0.9-2.0 m wide, uneven duct walls) with rollover, carpet friction (1.1-1.5)
-# and 0-240 ms action delay, on one H100, until the time limit.
+# and 0-240 ms action delay, on one GPU (H100 or V100), until the time limit.
 #
 #   sbatch --export=ALL,INIT_FROM=runs/phase1c/<run>/ckpt_01025.safetensors slurm/lab_finetune.sbatch
 #   options (env): ARCH (cnn_gru | mlp), FRAME_STACK (1 for cnn_gru, 3 for the MLP-3), LR (1e-4),
@@ -9,7 +9,7 @@
 #
 #SBATCH --job-name=rl-lab-ft
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=h100
+#SBATCH --constraint=h100|gpu32|gpu16
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=11:00:00
@@ -20,13 +20,20 @@ cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 mkdir -p slurm/logs
 : "${INIT_FROM:?set INIT_FROM to a phase-1c checkpoint}"
 export PATH="$HOME/.local/bin:$PATH" XLA_PYTHON_CLIENT_PREALLOCATE=false WANDB_MODE=offline
-export UV_PROJECT_ENVIRONMENT="${VENV:-$PWD/.venv}"
+# H100 or V100 (16/32 GB), whichever frees up first: CUDA 13 dropped Volta, so on a V100 the same
+# JAX runs from its CUDA 12 build (.venv-cu12, as in train_phase1.sbatch); a run uses ~8 GB.
+case "$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)" in
+  *H100*) DEFAULT_VENV="$PWD/.venv" ;;
+  *)      DEFAULT_VENV="$PWD/.venv-cu12" ;;
+esac
+export UV_PROJECT_ENVIRONMENT="${VENV:-$DEFAULT_VENV}"
 export F1TENTH_GYM_JAX_MAP_DIR="${MAP_DIR:-$PWD/rl/maps}"
 TRAIN_SECONDS="${TRAIN_SECONDS:-37800}"
 ARCH="${ARCH:-cnn_gru}"
 FRAME_STACK="${FRAME_STACK:-$([ "$ARCH" = cnn_gru ] && echo 1 || echo 3)}"
 echo "host $(hostname) job ${SLURM_JOB_ID:-local} commit $(git rev-parse --short HEAD) arch $ARCH init_from $INIT_FROM"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+echo "env $UV_PROJECT_ENVIRONMENT"
 
 echo "=== lab tracks"
 uv run --frozen python -m rl.maps prepare --lab --map-dir "$F1TENTH_GYM_JAX_MAP_DIR" | tail -1

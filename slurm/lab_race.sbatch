@@ -5,8 +5,8 @@
 #   obstacles  a parked car where the corridor leaves room to pass (80% of episodes, else solo)
 #   mixed      odd-numbered maps obstacles, the others opponents
 # plus rollover, carpet friction, 0-240 ms delay, the car's steering, random direction per episode,
-# 5.5-6.5 m/s^2 acceleration, 5 laps per episode. From a phase-1c checkpoint, on one H100, until the
-# time limit (clean stop with a checkpoint).
+# 5.5-6.5 m/s^2 acceleration, 5 laps per episode. From a phase-1c checkpoint, on one GPU (H100 or V100), until
+# the time limit (clean stop with a checkpoint).
 #
 #   sbatch --export=ALL,INIT_FROM=runs/phase1c/<run>/ckpt_02050.safetensors,RACE_MODE=opponents slurm/lab_race.sbatch
 #   options (env): ARCH (cnn_gru | mlp), FRAME_STACK (1 / 3), RACE_MODE, LR (1e-4), VF_COEF (0.1),
@@ -14,7 +14,7 @@
 #
 #SBATCH --job-name=rl-lab-race
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=h100
+#SBATCH --constraint=h100|gpu32|gpu16
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=11:00:00
@@ -25,7 +25,13 @@ cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 mkdir -p slurm/logs
 : "${INIT_FROM:?set INIT_FROM to a phase-1c checkpoint}"
 export PATH="$HOME/.local/bin:$PATH" XLA_PYTHON_CLIENT_PREALLOCATE=false WANDB_MODE=offline
-export UV_PROJECT_ENVIRONMENT="${VENV:-$PWD/.venv}"
+# H100 or V100 (16/32 GB), whichever frees up first: CUDA 13 dropped Volta, so on a V100 the same
+# JAX runs from its CUDA 12 build (.venv-cu12, as in train_phase1.sbatch); a run uses ~8 GB.
+case "$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)" in
+  *H100*) DEFAULT_VENV="$PWD/.venv" ;;
+  *)      DEFAULT_VENV="$PWD/.venv-cu12" ;;
+esac
+export UV_PROJECT_ENVIRONMENT="${VENV:-$DEFAULT_VENV}"
 export F1TENTH_GYM_JAX_MAP_DIR="${MAP_DIR:-$PWD/rl/maps}"
 TRAIN_SECONDS="${TRAIN_SECONDS:-37800}"
 ARCH="${ARCH:-cnn_gru}"
@@ -33,6 +39,7 @@ FRAME_STACK="${FRAME_STACK:-$([ "$ARCH" = cnn_gru ] && echo 1 || echo 3)}"
 RACE_MODE="${RACE_MODE:-opponents}"
 echo "host $(hostname) job ${SLURM_JOB_ID:-local} commit $(git rev-parse --short HEAD) arch $ARCH mode $RACE_MODE init_from $INIT_FROM"
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+echo "env $UV_PROJECT_ENVIRONMENT"
 
 uv run --frozen python -m rl.maps prepare --lab --map-dir "$F1TENTH_GYM_JAX_MAP_DIR" | tail -1
 read -r -a TRAIN <<< "$(uv run --frozen python -c 'from rl import maps as M; print(" ".join(M.LAB_FT_TRAIN_MAPS))')"

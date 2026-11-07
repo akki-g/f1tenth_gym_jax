@@ -34,7 +34,7 @@ read -r -a TRAIN <<< "$(uv run --frozen python -c 'from rl import maps as M; pri
 read -r -a HELDOUT <<< "$(uv run --frozen python -c 'from rl import maps as M; print(" ".join(M.LAB_FT_HELDOUT_MAPS))')"
 ARGS=(--arch "$ARCH" --frame-stack "$FRAME_STACK" --init-from "$INIT_FROM"
       --lr "${LR:-1e-4}" --vf-coef 0.1 --ent-coef 0.005 --seed "${SEED:-0}" --num-envs 2048
-      --max-delay 6 --rollover true --friction-lo 1.1 --friction-hi 1.5 --max-laps 5
+      --max-delay 6 --rollover true --steer-asym true --friction-lo 1.1 --friction-hi 1.5 --max-laps 5
       --train-maps "${TRAIN[@]}" --heldout-maps "${HELDOUT[@]}" --wandb-mode offline)
 
 # No throughput probe: compiling 32 maps takes longer than a short probe, which then sized the budget from

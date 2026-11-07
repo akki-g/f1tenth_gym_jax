@@ -45,7 +45,8 @@ from f1tenth_gym_jax.envs.laser_models import _distance_at
 
 from . import car_params as cp
 from . import obs as ob
-from .wrappers import Phase1Wrapper, WrapperState, add_steer_offset, delay_action, lateral_accel, step_reward
+from .wrappers import (Phase1Wrapper, WrapperState, add_steer_offset, apply_steer_gain, delay_action, lateral_accel,
+                       step_reward)
 
 OPP_SOLO, OPP_SNAPSHOT, OPP_FTG, OPP_PURSUIT = 0, 1, 2, 3
 OPP_NAMES = ("solo", "snapshot", "follow_gap", "pursuit")
@@ -341,6 +342,7 @@ class RaceWrapper(Phase1Wrapper):
         command = jnp.stack([steer_cmd, speed_cmd])
         executed, delay_buffer = delay_action(st.delay_buffer, st.delay_k, command)
         executed = add_steer_offset(executed, st.steer_offset)
+        executed = apply_steer_gain(executed, st.steer_gain)
         opp_cmd, opp_h, opp_prev = self._opp_action(k_opp, rs, opp_params)
 
         _, es, rewards, _, _ = self._env.step_env(k_env, st.env_state, {"agent_0": executed, "agent_1": opp_cmd})

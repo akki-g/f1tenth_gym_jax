@@ -32,7 +32,7 @@ read -r -a HELDOUT <<< "$(uv run --frozen python -c 'from rl import maps as M; p
 echo "=== race train on ${#TRAIN[@]} maps (until $((TRAIN_SECONDS - 300)) s)"
 uv run --frozen python -m rl.train_ppo --arch cnn_gru --frame-stack 1 --race true --init-from "$INIT_FROM" \
   --critic-warmup 20 --lr "${LR:-1e-4}" --anneal-lr false --vf-coef "${VF_COEF:-0.1}" --ent-coef 0.005 \
-  --seed "${SEED:-0}" --num-envs 2048 --max-delay 6 --rollover true --friction-lo 1.1 --friction-hi 1.5 \
+  --seed "${SEED:-0}" --num-envs 2048 --max-delay 6 --rollover true --steer-asym true --friction-lo 1.1 --friction-hi 1.5 \
   --max-laps 5 --train-maps "${TRAIN[@]}" --heldout-maps "${HELDOUT[@]}" --wandb-mode offline \
   --total-timesteps 20000000000 --time-limit "$((TRAIN_SECONDS - 300))" --runs-root runs/lab_race
 echo "done $(date -Is)"

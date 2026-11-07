@@ -352,3 +352,20 @@ def test_rollover_threshold_by_turn_direction(test_map_dir, monkeypatch, a_lat, 
             assert ended == cp.ROLL_STEPS and bool(info["rollover"]) and float(reward) < -0.9
         else:
             assert ended is None and not bool(info["rollover"])
+
+
+def test_steer_asymmetry_scales_left_and_right_turns(test_map_dir):
+    """Nominal gains are the midpoints: left turns x0.95, right turns x0.85; off: x1."""
+    gl, gr = sum(cp.STEER_GAIN_LEFT) / 2, sum(cp.STEER_GAIN_RIGHT) / 2
+    for on, (exp_l, exp_r) in ((True, (gl, gr)), (False, (1.0, 1.0))):
+        env = _fine_env(stall_steps=0, wrong_way_steps=0, steer_asym=on)
+        for a_s, exp in ((0.5, exp_l), (-0.5, exp_r)):
+            _, ws = env.reset_at(jax.random.PRNGKey(0), jnp.array(0.0))
+            _, _, _, _, info = env.step(jax.random.PRNGKey(1), ws, jnp.array([-0.6, a_s]))
+            assert float(info["executed_command"][0]) == pytest.approx(a_s * cp.S_MAX * exp, rel=1e-5), (on, a_s)
+    # randomized: every episode draws its own pair, the right gain from the weaker range
+    from rl.wrappers import steer_gains
+    g = np.asarray(jax.vmap(lambda k: steer_gains(k, True))(jax.random.split(jax.random.PRNGKey(2), N_ENVS)))
+    assert g[:, 0].min() >= cp.STEER_GAIN_LEFT[0] and g[:, 0].max() <= cp.STEER_GAIN_LEFT[1]
+    assert g[:, 1].min() >= cp.STEER_GAIN_RIGHT[0] and g[:, 1].max() <= cp.STEER_GAIN_RIGHT[1]
+    assert g[:, 1].mean() < g[:, 0].mean()

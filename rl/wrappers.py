@@ -72,6 +72,7 @@ class WrapperState:
     tip_left: chex.Array  # m/s^2, this episode's tipping limit in left turns
     tip_right: chex.Array  # m/s^2, in right turns
     roll_count: chex.Array  # consecutive steps above the tipping limit
+    steer_gain: chex.Array  # [2] this episode's executed-steering gain in left / right turns
 
 
 def delay_action(buffer, k, command):
@@ -108,6 +109,22 @@ def tip_limits(key, randomize):
     return left.astype(jnp.float32), right.astype(jnp.float32)
 
 
+def steer_gains(key, randomize):
+    """[left, right] executed-steering gains for one episode (car_params STEER_GAIN_*)."""
+    if randomize:
+        k_l, k_r = jax.random.split(key)
+        left = jax.random.uniform(k_l, (), minval=cp.STEER_GAIN_LEFT[0], maxval=cp.STEER_GAIN_LEFT[1])
+        right = jax.random.uniform(k_r, (), minval=cp.STEER_GAIN_RIGHT[0], maxval=cp.STEER_GAIN_RIGHT[1])
+        return jnp.stack([left, right]).astype(jnp.float32)
+    return jnp.array([sum(cp.STEER_GAIN_LEFT) / 2, sum(cp.STEER_GAIN_RIGHT) / 2], jnp.float32)
+
+
+def apply_steer_gain(command, gain):
+    """Scale an env command's steering ([steer, speed]) by the left (steer > 0) or right gain."""
+    steer = command[0]
+    return command.at[0].set(steer * jnp.where(steer >= 0.0, gain[0], gain[1]))
+
+
 def lateral_accel(env_state):
     """v * yaw_rate of agent 0, m/s^2; positive in left turns."""
     return env_state.cartesian_states[0, 3] * env_state.cartesian_states[0, 5]
@@ -140,6 +157,7 @@ class Phase1Wrapper:
         frame_stack: int = ob.FRAME_STACK,
         max_delay: int = cp.MAX_DELAY_STEPS,
         rollover: bool = False,
+        steer_asym: bool = False,
     ):
         p = env.params
         if env.num_agents != self.NUM_AGENTS:
@@ -167,6 +185,7 @@ class Phase1Wrapper:
         self.wrong_way_steps = int(wrong_way_steps)
         self.stall_steps = int(stall_steps)
         self.rollover = bool(rollover)
+        self.steer_asym = bool(steer_asym)
         # wall-buffer check on a window of the map around the car, sized to
         # cover the largest inflated footprint (same test as the env's
         # collision_map, without scanning every wall pixel of the map)
@@ -232,6 +251,8 @@ class Phase1Wrapper:
         _, env_state = self._env.reset(k_env)
         delay_k, steer_offset, margin = self._episode_draws(k_ep)
         tip_left, tip_right = tip_limits(jax.random.fold_in(k_ep, 7), self.randomize)  # own stream: the other draws keep theirs
+        steer_gain = (steer_gains(jax.random.fold_in(k_ep, 13), self.randomize) if self.steer_asym
+                      else jnp.ones(2, jnp.float32))
         stack = ob.init_stack(self._sense(k_noise, env_state), self.frame_stack, xp=jnp)
         prev_action = ob.reset_action(xp=jnp)
         state = WrapperState(
@@ -251,6 +272,7 @@ class Phase1Wrapper:
             tip_left=tip_left,
             tip_right=tip_right,
             roll_count=jnp.zeros((), jnp.int32),
+            steer_gain=steer_gain,
         )
         speed = env_state.cartesian_states[0, 3]
         return ob.build_obs(stack, speed, prev_action, xp=jnp), state
@@ -289,6 +311,7 @@ class Phase1Wrapper:
         # 1-2. actuation
         executed, delay_buffer = delay_action(state.delay_buffer, state.delay_k, command)
         executed = add_steer_offset(executed, state.steer_offset)
+        executed = apply_steer_gain(executed, state.steer_gain)
 
         # env (3. scan origin offset is applied in the env's _scan)
         _, env_state, rewards, dones, _ = self._env.step_env(

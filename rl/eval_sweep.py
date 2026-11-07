@@ -37,7 +37,8 @@ UNSEEN_MAPS = UNSEEN_RACETRACKS + tuple(unseen_gen_name(s) for s in UNSEEN_GEN_S
 assert not set(UNSEEN_MAPS) & set(M.TRAIN_MAPS + M.HELDOUT_MAPS)
 GROUPS = {"heldout": M.HELDOUT_MAPS, "unseen": UNSEEN_MAPS}
 # lab suite: lab-size tracks only (held-out: picks checkpoints; unseen: used by neither)
-SUITES = {"phase1c": GROUPS, "lab": {"heldout": M.LAB_HELDOUT_MAPS, "unseen": M.LAB_UNSEEN_MAPS}}
+SUITES = {"phase1c": GROUPS,
+          "lab": {"heldout": M.LAB_FT_HELDOUT_MAPS, "unseen": M.LAB_EVAL_UNSEEN_MAPS, "lastrace": M.LAST_RACE_MAPS}}
 
 
 def prepare_unseen(map_dir=M.DEFAULT_MAP_DIR) -> dict:
@@ -89,7 +90,7 @@ def run(checkpoints, settings, episodes, max_steps, out_dir: pathlib.Path, suite
     cfg = loaded[-1][1]["config"]
     wrapper_kwargs, friction = wrapper_kwargs_from(cfg), friction_from(cfg)
     if lab_physics:
-        wrapper_kwargs.update(rollover=True, max_delay=cp.LAB_MAX_DELAY_STEPS)
+        wrapper_kwargs.update(rollover=True, steer_asym=True, max_delay=cp.LAB_MAX_DELAY_STEPS)
         friction = cp.LAB_FRICTION
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = []
@@ -136,7 +137,8 @@ def main(argv=None):
     r.add_argument("--map-dir", default=str(M.DEFAULT_MAP_DIR))
     r.add_argument("--out-dir", type=pathlib.Path, default=None)
     r.add_argument("--suite", choices=sorted(SUITES), default="phase1c")
-    r.add_argument("--lab-physics", action="store_true", help="rollover, carpet friction, 0-240 ms delay")
+    r.add_argument("--lab-physics", action="store_true",
+                   help="rollover, carpet friction, 0-240 ms delay, weaker right-turn steering")
     args = parser.parse_args(argv)
 
     if args.cmd == "prepare":

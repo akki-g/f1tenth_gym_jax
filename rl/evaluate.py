@@ -174,7 +174,7 @@ def make_evaluator(
 
 
 WRAPPER_KEYS = ("wall_margin", "wall_margin_noise", "wrong_way_steps", "stall_steps", "frame_stack", "max_delay",
-                "rollover")
+                "rollover", "steer_asym")
 
 
 def friction_from(config: dict) -> tuple:

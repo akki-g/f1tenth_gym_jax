@@ -108,6 +108,11 @@ GRAVITY = 9.81  # m/s^2
 LAB_FRICTION = (1.1, 1.5)  # mu range (carpet); nominal is the midpoint
 LAB_MAX_DELAY_STEPS = 6  # action delay 0..6 policy steps (0-240 ms)
 LAB_MAX_LAPS = 5  # laps per training episode on 10-20 m tracks
+# Steering asymmetry (lab fine-tune; off by default): the car understeers in right turns. Per episode the
+# executed steering angle is scaled by a left-turn gain (positive angles) and a right-turn gain
+# (negative angles); nominal episodes use the midpoints.
+STEER_GAIN_LEFT = (0.85, 1.05)
+STEER_GAIN_RIGHT = (0.70, 1.00)
 # Reset offset: the env starts agent 0 up to RESET_EY_MAX off the centerline.
 # make_param shrinks that on maps whose narrowest half-width leaves less than
 # RESET_CLEARANCE (half the car, the widest wall buffer, 5 cm) beside it;

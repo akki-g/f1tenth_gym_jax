@@ -58,7 +58,8 @@ from .networks import (  # noqa: E402
 _BOOKKEEPING = ("runs_root", "wandb_mode", "wandb_project", "time_limit", "map_dir", "fresh", "run_dir")
 # Fields added for the lab fine-tune: left out of the run hash at their defaults,
 # so earlier runs keep their directories (and resume).
-_HASH_OPTIONAL = {"rollover": False, "friction_lo": 0.0, "friction_hi": 0.0, "max_laps": cp.MAX_LAPS}
+_HASH_OPTIONAL = {"rollover": False, "friction_lo": 0.0, "friction_hi": 0.0, "max_laps": cp.MAX_LAPS,
+                  "steer_asym": False}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,6 +108,7 @@ class Config:
     wrong_way_steps: int = cp.WRONG_WAY_STEPS
     stall_steps: int = cp.STALL_STEPS
     rollover: bool = False  # end episodes on tipping (car_params TIP_*; lab fine-tune)
+    steer_asym: bool = False  # weaker right-turn steering, per episode (car_params STEER_GAIN_*; lab fine-tune)
     friction_lo: float = 0.0  # friction_hi > 0: mu range [lo, hi] replaces car_params' (lab: 1.1-1.5)
     friction_hi: float = 0.0
     max_laps: int = cp.MAX_LAPS  # laps per training episode (evaluation always uses 1)
@@ -129,7 +131,8 @@ class Config:
     def wrapper_kwargs(self) -> dict:
         return {"wall_margin": self.wall_margin, "wall_margin_noise": self.wall_margin_noise,
                 "wrong_way_steps": self.wrong_way_steps, "stall_steps": self.stall_steps,
-                "frame_stack": self.frame_stack, "max_delay": self.max_delay, "rollover": self.rollover}
+                "frame_stack": self.frame_stack, "max_delay": self.max_delay, "rollover": self.rollover,
+                "steer_asym": self.steer_asym}
 
     def friction(self) -> tuple:
         return (self.friction_lo, self.friction_hi) if self.friction_hi > 0 else ()

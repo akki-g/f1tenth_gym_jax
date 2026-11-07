@@ -583,13 +583,39 @@ def _periodic_spline(points, spacing=0.1):
     return _resample_closed(dense, spacing)
 
 
-def build_duct_track(walls, waypoints, reverse=False):
+def _rugged_wall(poly, rng, amp, closed):
+    """A duct line made uneven: moved along its normal by 3 smooth waves (0.6-3 m wavelength, up
+    to ``amp`` each) and 0-2 local kinks (1-2 x amp); an open wall's offset fades to 0 over its
+    last 0.5 m at both ends, so walls stay attached where they meet."""
+    s = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(poly, axis=0).T))])
+    length = s[-1]
+    t = np.gradient(poly, axis=0)
+    t /= np.maximum(np.linalg.norm(t, axis=1, keepdims=True), 1e-9)
+    normal = np.c_[-t[:, 1], t[:, 0]]
+    off = np.zeros(len(poly))
+    for _ in range(3):
+        wl, a, ph = rng.uniform(0.6, 3.0), rng.uniform(0.0, amp), rng.uniform(0, 2 * np.pi)
+        off += a * np.sin(2 * np.pi * (max(1, round(length / wl)) * s / length if closed else s / wl) + ph)
+    for _ in range(rng.randint(0, 3)):
+        d = np.abs(s - rng.uniform(0, length))
+        d = np.minimum(d, length - d) if closed else d
+        off += rng.choice([-1.0, 1.0]) * rng.uniform(1.0, 2.0) * amp * np.exp(-0.5 * (d / rng.uniform(0.15, 0.4)) ** 2)
+    if not closed:
+        off *= np.clip(np.minimum(s, length - s) / 0.5, 0.0, 1.0)
+    return poly + normal * off[:, None]
+
+
+def build_duct_track(walls, waypoints, reverse=False, rugged=0.0, rng=None, closed=None):
     """Render ducts (polylines along the ducts' centre lines; 0.30 m thick) and a centerline: a
     periodic spline through ``waypoints``, starting at waypoint 0 (``reverse``: same start, other
-    direction). Half-width: the clearance to the nearest wall at each centerline point."""
+    direction). ``rugged`` > 0: every wall made uneven by up to that much (_rugged_wall; ``closed``
+    flags which walls are loops). Half-width: the clearance to the nearest wall at each centerline point."""
     from scipy.ndimage import distance_transform_edt
     from scipy.spatial import cKDTree
 
+    if rugged > 0:
+        closed = closed or [True] * len(walls)
+        walls = [_rugged_wall(w, rng, rugged, c) for w, c in zip(walls, closed)]
     pts = np.vstack(walls)
     res = GEN_RESOLUTION
     lo, hi = pts.min(axis=0) - LAB_WALL - GEN_MARGIN, pts.max(axis=0) + LAB_WALL + GEN_MARGIN
@@ -708,38 +734,45 @@ RACE_LIKE_CORRIDOR = (0.9, 2.0)  # m, narrowest / widest corridor of the race-li
 def generate_race_like_track(seed: int):
     """A track like the last race's (race_layout with random sizes; mirrored or not, either
     direction; usually spur and hook, sometimes only one), or None if the corridor narrows
-    below 0.9 m, the centerline turns tighter than 0.75 m or comes within 0.3 m of a wall,
+    below 0.9 m, the centerline turns tighter than 0.75 m or comes within 0.27 m of a wall,
     or the lap is not 14-40 m."""
     rng = np.random.RandomState(seed)
     variant = rng.choice(3, p=(0.6, 0.2, 0.2))
     hook, spur = variant != 2, variant != 1
-    gaps = (rng.uniform(1.1, 1.8), rng.uniform(1.2, 2.0), rng.uniform(1.2, 1.9))
-    c1, c2 = rng.uniform(1.1, 1.6, size=2)  # wide enough for U-turns the car can make (radius >= ~0.85 m)
-    pocket, hook_gap = rng.uniform(1.3, 1.8), rng.uniform(1.4, 2.0)
-    g_top, corner = rng.uniform(1.1, 1.8), rng.uniform(1.6, 2.6)
+    gaps = (rng.uniform(1.0, 1.6), rng.uniform(1.1, 1.8), rng.uniform(1.1, 1.7))  # on the narrow side of 0.9-2.0 m
+    c1, c2 = rng.uniform(1.05, 1.4, size=2)  # wide enough for U-turns the car can make (radius >= ~0.8 m)
+    pocket, hook_gap = rng.uniform(1.2, 1.6), rng.uniform(1.3, 1.8)
+    g_top, corner = rng.uniform(1.0, 1.6), rng.uniform(1.5, 2.4)
     # the island is wide enough that the hook reaches 0.8-1.6 m past the spur's end
     reach = (0.8 + hook_gap + pocket + 2 * LAB_WALL - gaps[1]) if (spur and hook) else 1.2
     island = (float(np.clip(reach + rng.uniform(0.0, 0.8), 1.2, 3.6)), rng.uniform(1.0, 5.5))
     mirror, reverse = rng.rand() < 0.5, rng.rand() < 0.5
+    rugged = rng.uniform(0.03, 0.07) if rng.rand() < 0.6 else 0.0  # most tracks: uneven duct walls
     W = sum(gaps[:2]) + island[0]
     if spur and hook and (W - hook_gap - LAB_WALL / 2) - (gaps[0] + LAB_WALL + pocket + LAB_WALL / 2) < 0.8:
         return None  # the hook must reach past the spur's end
     walls, pts = race_layout(gaps, island, c1, c2, pocket, hook_gap, g_top, corner, hook, spur, mirror)
-    g = build_duct_track(walls, pts, reverse=reverse)
-    # narrowest point strict; the widest 5% (where a corridor meets a turn diagonally) may exceed 2 m
-    # every corridor is drawn within 0.9-2.0 m above; check the narrowest point as rendered
-    # (where a corridor meets a turn, the diagonal across it is wider, as on the real track)
-    if g["min_width"] < RACE_LIKE_CORRIDOR[0]:
-        return None
-    if g["min_clearance"] < 0.3:  # the centerline keeps half the car plus margin from every wall
-        return None
-    if g["min_radius"] < 0.75 or not 14.0 <= g["length"] <= 40.0:
-        return None
-    return g
+    closed = [True, True] + [False] * (len(walls) - 2)
+
+    def ok(g):
+        # every corridor is drawn within 0.9-2.0 m above; check the narrowest point as rendered (where a
+        # corridor meets a turn, the diagonal across it is wider, as on the real track); the centerline
+        # keeps half the car, the wall buffer and 5 cm from every wall; turns the car can make; a lab lap
+        return (g["min_width"] >= RACE_LIKE_CORRIDOR[0] and g["min_clearance"] >= 0.27
+                and g["min_radius"] >= 0.75 and 14.0 <= g["length"] <= 40.0)
+
+    # uneven walls: the drawn amplitude, then gentler ones, before falling back to straight walls
+    for amp in ((rugged, 0.7 * rugged, 0.5 * rugged) if rugged > 0 else ()) + (0.0,):
+        g = build_duct_track(walls, pts, reverse=reverse, rugged=amp, rng=np.random.RandomState(seed + 7919),
+                             closed=closed)
+        if ok(g):
+            g["rugged"] = float(amp)
+            return g
+    return None
 
 
 def race_like_name(seed: int) -> str:
-    return f"RaceLike{seed}"
+    return f"RaceLike{seed}"  # seeds 6000+: wider, straight walls; 20000+: narrower, mostly rugged
 
 
 # ---------------------------------------------------------------------------
@@ -747,9 +780,11 @@ def race_like_name(seed: int) -> str:
 # ---------------------------------------------------------------------------
 TRAP_LENGTH = (14.0, 26.0)  # m
 TRAP_STRETCH = (2.0, 3.0)  # length / width of the base loop: long straights
-TRAP_WIDTH = (1.0, 1.6)  # m, mean corridor width off the trap
+TRAP_WIDTH = (0.9, 1.4)  # m, mean corridor width off the trap
 TRAP_STRAIGHT_WIDTH = (2.0, 3.0)  # m, the trap straight's width
 TRAP_MIN_STRAIGHT = 3.0  # m
+TRAP_SQUARENESS = (4.0, 6.0)  # superellipse exponent: squarer corners than the lab loops
+TRAP_MIN_RADIUS = 0.75  # m: corners as tight as the car turns
 
 
 def generate_trap_track(seed: int):
@@ -763,7 +798,7 @@ def generate_trap_track(seed: int):
     rng = np.random.RandomState(seed)
     length = rng.uniform(*TRAP_LENGTH)
     th = np.linspace(0.0, 2 * np.pi, 1440, endpoint=False)
-    p = rng.uniform(3.0, 4.5)
+    p = rng.uniform(*TRAP_SQUARENESS)
     r = (np.abs(np.cos(th)) ** p + np.abs(np.sin(th)) ** p) ** (-1.0 / p)
     for k_h in (2, 3):
         r *= 1.0 + rng.uniform(0.0, 0.12 / k_h**0.7) * np.cos(k_h * th + rng.uniform(0, 2 * np.pi))
@@ -776,7 +811,7 @@ def generate_trap_track(seed: int):
     xy = _resample_closed(xy * (length / np.sum(np.hypot(*np.diff(np.vstack([xy, xy[:1]]), axis=0).T))), 0.05)
     k = _curvature_closed(xy)
     min_radius = 1.0 / np.max(np.abs(k))
-    if min_radius < LAB_MIN_RADIUS:
+    if min_radius < TRAP_MIN_RADIUS:
         return None
     n = len(xy)
     s = np.arange(n) * (length / n)
@@ -849,7 +884,7 @@ def generate_trap_track(seed: int):
 
 
 def trap_name(seed: int) -> str:
-    return f"Trap{seed}"
+    return f"Trap{seed}"  # seeds 9000+: 1.0-1.6 m off the trap; 50000+: 0.9-1.4 m, sharper corners
 
 
 # ---------------------------------------------------------------------------
@@ -901,13 +936,12 @@ ROOM_UNSEEN_MAPS = tuple(room_name(s) for s in ROOM_UNSEEN_SEEDS)
 # Race-like tracks (generate_race_like_track) and speed-trap tracks (generate_trap_track): first valid
 # seeds from 6000 / 6500 / 6900 and 9000 / 9500 / 9900 (train / held-out / never-seen; trap seeds
 # 7000+ widened both walls, 8000+ one wall on a random side).
-RACE_LIKE_TRAIN_SEEDS = (6009, 6047, 6057, 6089, 6095, 6110, 6113, 6120, 6121, 6133, 6139,
-                         6140, 6145, 6153, 6183, 6193, 6196, 6231, 6244, 6255, 6258, 6262)
-RACE_LIKE_HELDOUT_SEEDS = (6596, 6599, 6600, 6607, 6629)
-RACE_LIKE_UNSEEN_SEEDS = (6922, 6935, 6940, 6971)
-TRAP_TRAIN_SEEDS = (9004, 9015, 9031, 9033, 9037, 9038, 9047, 9060)
-TRAP_HELDOUT_SEEDS = (9510, 9516, 9522)
-TRAP_UNSEEN_SEEDS = (9906, 9910)
+RACE_LIKE_TRAIN_SEEDS = (20010, 20012, 20013, 20021, 20024, 20047, 20050, 20059, 20065, 20070, 20088, 20102, 20113, 20114, 20140, 20183, 20186, 20195, 20198, 20235, 20251, 20273)
+RACE_LIKE_HELDOUT_SEEDS = (30002, 30011, 30016, 30022, 30033)
+RACE_LIKE_UNSEEN_SEEDS = (40000, 40002, 40013, 40064)
+TRAP_TRAIN_SEEDS = (50023, 50055, 50104, 50110, 50141, 50144, 50158, 50178)
+TRAP_HELDOUT_SEEDS = (60049, 60060, 60064)
+TRAP_UNSEEN_SEEDS = (70027, 70038)
 RACE_LIKE_TRAIN_MAPS = tuple(race_like_name(s) for s in RACE_LIKE_TRAIN_SEEDS)
 RACE_LIKE_HELDOUT_MAPS = tuple(race_like_name(s) for s in RACE_LIKE_HELDOUT_SEEDS)
 RACE_LIKE_UNSEEN_MAPS = tuple(race_like_name(s) for s in RACE_LIKE_UNSEEN_SEEDS)
@@ -947,7 +981,7 @@ def prepare_maps(map_dir: os.PathLike = DEFAULT_MAP_DIR, maps=TRAIN_MAPS + HELDO
                   for s in LAB_TRAIN_SEEDS + LAB_HELDOUT_SEEDS + LAB_UNSEEN_SEEDS})
     seeds.update({room_name(s): (generate_room_track, s)
                   for s in ROOM_TRAIN_SEEDS + ROOM_HELDOUT_SEEDS + ROOM_UNSEEN_SEEDS})
-    seeds.update({"LastRace2": (last_race_track, False), "LastRace2Rev": (last_race_track, True)})
+    seeds.update({LAST_RACE_MAPS[0]: (last_race_track, False), LAST_RACE_MAPS[1]: (last_race_track, True)})
     seeds.update({race_like_name(s): (generate_race_like_track, s)
                   for s in RACE_LIKE_TRAIN_SEEDS + RACE_LIKE_HELDOUT_SEEDS + RACE_LIKE_UNSEEN_SEEDS})
     seeds.update({trap_name(s): (generate_trap_track, s) for s in TRAP_TRAIN_SEEDS + TRAP_HELDOUT_SEEDS + TRAP_UNSEEN_SEEDS})
@@ -1014,8 +1048,11 @@ class MultiMapEnv:
     """
 
     def __init__(self, map_names, num_envs: int, randomize: bool = True, wrapper_kwargs=None, race=None,
-                 **param_overrides):
-        """``race``: None for phase 1, else RaceWrapper kwargs (two-car env, phase 2)."""
+                 accel_range=(), obstacle_maps=(), **param_overrides):
+        """``race``: None for phase 1, else RaceWrapper kwargs (two-car env, phase 2).
+        ``accel_range`` (lo, hi): each map gets its own acceleration / braking limit spread over the
+        range (Param.a_max; one value per map, as the env compiles one per map). ``obstacle_maps``
+        (race): these maps park an obstacle instead of drawing an opponent."""
         import jax  # noqa: F401  (keep module import light for the CLI)
 
         from f1tenth_gym_jax.envs import F110Env
@@ -1034,21 +1071,30 @@ class MultiMapEnv:
             from .race import RaceWrapper
 
             self.wrappers = [
-                RaceWrapper(F110Env(2, make_param(m, randomize=randomize, scan_other_agents=True, **param_overrides)),
-                            randomize, **race, **(wrapper_kwargs or {}))
-                for m in self.map_names
+                RaceWrapper(F110Env(2, make_param(m, randomize=randomize, scan_other_agents=True,
+                                                  **self._accel(i, accel_range), **param_overrides)),
+                            randomize, **race, obstacles=m in set(obstacle_maps), **(wrapper_kwargs or {}))
+                for i, m in enumerate(self.map_names)
             ]
         else:
             self.wrappers = [
-                Phase1Wrapper(F110Env(1, make_param(m, randomize=randomize, **param_overrides)), randomize,
-                              **(wrapper_kwargs or {}))
-                for m in self.map_names
+                Phase1Wrapper(F110Env(1, make_param(m, randomize=randomize, **self._accel(i, accel_range),
+                                                    **param_overrides)), randomize, **(wrapper_kwargs or {}))
+                for i, m in enumerate(self.map_names)
             ]
         self.obs_dim = self.wrappers[0].obs_dim
         self.action_dim = self.wrappers[0].action_dim
         import jax.numpy as jnp
 
         self.map_ids = jnp.repeat(jnp.arange(len(self.map_names)), self.envs_per_map)
+
+    @staticmethod
+    def _accel(i, accel_range):
+        """Map i's acceleration limit: spread over the range by a golden-ratio sequence."""
+        if not accel_range:
+            return {}
+        lo, hi = accel_range
+        return {"a_max": float(lo + (hi - lo) * ((i * 0.6180339887) % 1.0))}
 
     def reset(self, key):
         import jax

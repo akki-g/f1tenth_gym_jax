@@ -39,6 +39,7 @@ def make_evaluator(
     model_cfg=None,
     wrapper_kwargs=None,
     friction=(),
+    accel=(),
 ):
     """Returns evaluate(actor_params, normalizer) -> report dict.
 
@@ -59,6 +60,7 @@ def make_evaluator(
         Phase1Wrapper(
             F110Env(1, make_param(m, randomize=randomize, max_steps=max_steps, num_beams=model_cfg["num_beams"],
                                   **friction_overrides(friction, randomize),
+                                  **({"a_max": float(sum(accel) / 2)} if accel else {}),
                                   **steer_overrides(bool((wrapper_kwargs or {}).get("steer_asym", False))))),
             randomize,
             max_laps=1,
@@ -175,7 +177,12 @@ def make_evaluator(
 
 
 WRAPPER_KEYS = ("wall_margin", "wall_margin_noise", "wrong_way_steps", "stall_steps", "frame_stack", "max_delay",
-                "rollover", "steer_asym")
+                "rollover", "steer_asym", "random_direction")
+
+
+def accel_from(config: dict) -> tuple:
+    hi = float(config.get("accel_hi", 0.0) or 0.0)
+    return (float(config["accel_lo"]), hi) if hi > 0 else ()
 
 
 def friction_from(config: dict) -> tuple:
@@ -214,7 +221,7 @@ def main(argv=None):
     evaluate = make_evaluator(args.maps, args.episodes, args.max_steps, args.randomize,
                               model_cfg=model_cfg_from(ckpt["config"]),
                               wrapper_kwargs=wrapper_kwargs_from(ckpt["config"]),
-                              friction=friction_from(ckpt["config"]))
+                              friction=friction_from(ckpt["config"]), accel=accel_from(ckpt["config"]))
     report = evaluate(ckpt["actor_params"], ckpt["normalizer"])
     report["checkpoint"] = str(args.checkpoint)
     report["checkpoint_sha256"] = ckpt["sha256"]

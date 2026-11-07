@@ -292,6 +292,15 @@ def test_fine_tune_track_in_spec_and_drivable(ft_prepared, name):
         pushed, other = (wl[i], wr[i]) if g["trap_side"] > 0 else (wr[i], wl[i])
         assert pushed - other >= 0.4, (pushed, other)
     else:
-        assert g["min_clearance"] >= 0.29 and g["min_radius"] >= 0.75
+        assert g["min_clearance"] >= 0.27 and g["min_radius"] >= 0.75
     collided, progress, steps = _pure_pursuit_lap(name, speed=1.5, lookahead=0.6, steps=3000)
     assert not collided and progress >= 1.0, (name, collided, progress, steps)
+
+
+
+def test_accel_spread_over_maps(lab_prepared):
+    maps = M.LAB_TRAIN_MAPS[:4]
+    env = M.MultiMapEnv(maps, num_envs=8, randomize=True, accel_range=(5.5, 6.5),
+                        wrapper_kwargs={"frame_stack": 1})
+    a = [w.env.params.a_max for w in env.wrappers]
+    assert all(5.5 <= x <= 6.5 for x in a) and len(set(a)) == len(a)

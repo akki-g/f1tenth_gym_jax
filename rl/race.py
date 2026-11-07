@@ -56,6 +56,9 @@ SLOW_SHARE = 0.5  # of pursuit opponents: slow cars on the racing line
 SLOW_SPEED = (0.7, 1.3)  # m/s
 NO_CAP = 100.0  # m/s: no speed cap
 LINE_CLEARANCE = cp.WIDTH / 2 + 0.2  # m: the racing line keeps half the car plus 20 cm from the walls
+OBSTACLE_SHARE = 0.8  # obstacle maps: episodes with a parked car (the rest solo)
+OBSTACLE_AHEAD_M = (2.0, 10.0)  # m ahead of the ego where an obstacle may be parked
+OBSTACLE_MIN_HALF = 0.55  # m: only where the corridor is >= 1.1 m wide, so it can be passed
 STAGGER_M = (1.0, 5.0)
 SIDE_BY_SIDE_MIN_HALF = 0.6  # m: side-by-side starts only where the corridor is >= 1.2 m wide (else staggered)
 PARK_XY = (1.0e4, 1.0e4)  # far beyond max range of any scan, off every map
@@ -95,19 +98,19 @@ def racing_line(map_name: str, track_length: float, clearance: float = LINE_CLEA
 
 
 def pure_pursuit(env: F110Env, car: chex.Array, s: chex.Array, speed_scale, v_max=6.0, a_lat=4.0,
-                 line=None, v_cap=NO_CAP):
+                 line=None, v_cap=NO_CAP, direction=1.0):
     """Line follower: [steer, speed]. Follows ``line`` = (s, ey) arrays (racing_line())
     or the centerline; the lookahead grows with speed (0.6-1.5 m); speed limited by the
     curvature ahead, times ``speed_scale``, at most ``v_cap``."""
     lookahead = jnp.clip(0.5 + 0.35 * car[3], 0.6, 1.5)
-    s_t = s + lookahead
+    s_t = s + direction * lookahead  # direction -1: the track run the other way round
     ey = 0.0 if line is None else jnp.interp(jnp.mod(s_t, env.track_length), line[0], line[1],
                                              period=env.track_length)
     target = env.track.vmap_frenet_to_cartesian_jax(jnp.stack([s_t, ey, 0.0])[None])[0]
     x, y, psi = car[0], car[1], car[4]
     alpha = jnp.arctan2(target[1] - y, target[0] - x) - psi
     steer = jnp.clip(jnp.arctan2(2.0 * cp.WHEELBASE * jnp.sin(alpha), lookahead), -cp.S_MAX, cp.S_MAX)
-    ks = jax.vmap(env.track.centerline.calc_curvature_jax)(s + jnp.array([0.0, 1.0, 2.0, 3.0]))
+    ks = jax.vmap(env.track.centerline.calc_curvature_jax)(s + direction * jnp.array([0.0, 1.0, 2.0, 3.0]))
     kappa = jnp.max(jnp.abs(ks))
     speed = speed_scale * jnp.minimum(v_max, jnp.sqrt(a_lat / jnp.maximum(kappa, 1e-3)))
     return jnp.array([steer, jnp.minimum(speed, v_cap)])
@@ -179,27 +182,34 @@ class RaceWrapper(Phase1Wrapper):
 
     def __init__(self, env: F110Env, randomize: bool = True, opponents: bool = True, gru_dim: int = 128,
                  snapshot_model=None, fixed_opponent=None, fixed_speed_scale=None, fixed_side_by_side=None,
-                 **kwargs):
+                 obstacles=False, privileged=True, **kwargs):
         """``fixed_*`` (evaluation): use this opponent type (OPP_*), speed factor and
-        start mode in every episode instead of drawing them."""
+        start mode in every episode instead of drawing them. ``obstacles``: instead of an
+        opponent, a parked car (OBSTACLE_SHARE of episodes) where the corridor leaves room to
+        pass. ``privileged`` False (the MLP): the observation keeps phase 1's layout, without
+        the critic's privileged block, and any frame stack."""
         super().__init__(env, randomize, **kwargs)
         if not env.params.scan_other_agents:
             raise ValueError("the race env must cast scans against the other car (scan_other_agents=True)")
-        if self.frame_stack != 1:
-            raise ValueError("the race wrapper feeds the CNN+GRU: frame_stack 1")
+        if privileged and self.frame_stack != 1:
+            raise ValueError("the privileged race layout feeds the CNN+GRU: frame_stack 1")
+        self.obstacles = bool(obstacles)
+        self.use_privileged = bool(privileged)
         self.opponents = opponents
         self.gru_dim = gru_dim
         self.snapshot_model = snapshot_model  # networks.CnnGru (race format) for snapshot opponents
         self.fixed_opponent = fixed_opponent
         self.fixed_speed_scale = fixed_speed_scale
         self.fixed_side_by_side = fixed_side_by_side
-        self.obs_dim = ob.obs_dim(1, self.num_beams) + PRIV_DIM
+        self.obs_dim = ob.obs_dim(self.frame_stack, self.num_beams) + (PRIV_DIM if privileged else 0)
         s_line, ey_line = racing_line(env.params.map_name, float(self.track_length))
         self.line = (jnp.asarray(s_line), jnp.asarray(ey_line))
 
     # ------------------------------------------------------------ helpers
     def _build_obs(self, stack, speed, prev_action, priv):
         base = ob.build_obs(stack, speed, prev_action, xp=jnp)
+        if not self.use_privileged:
+            return base
         n = self.num_beams
         return jnp.concatenate([base[:n], priv, base[n:]])
 
@@ -214,11 +224,12 @@ class RaceWrapper(Phase1Wrapper):
         fe, fo = es.frenet_states[0], es.frenet_states[1]
         present = rs.opp_type != OPP_SOLO
         dpsi = jnp.arctan2(jnp.sin(opp[4] - ego[4]), jnp.cos(opp[4] - ego[4]))
-        opp_part = jnp.where(present, jnp.array([self._signed_gap(fo[0], fe[0]) / 10.0, (fo[1] - fe[1]),
+        d = rs.ego.direction  # gaps and offsets in the driving direction
+        opp_part = jnp.where(present, jnp.array([d * self._signed_gap(fo[0], fe[0]) / 10.0, d * (fo[1] - fe[1]),
                                                  dpsi / jnp.pi, opp[3] / ob.V_CMD_MAX]), 0.0)
         v, beta = ego[3], ego[6]
         dp = es.dyn_params
-        own = jnp.array([v * jnp.cos(beta) / ob.V_CMD_MAX, v * jnp.sin(beta) / 2.0, ego[5] / 5.0, fe[1]])
+        own = jnp.array([v * jnp.cos(beta) / ob.V_CMD_MAX, v * jnp.sin(beta) / 2.0, ego[5] / 5.0, d * fe[1]])
         params = jnp.array([dp.mu[0] / cp.NOMINAL["mu"], dp.m[0] / cp.NOMINAL["m"],
                             dp.C_Sf[0] / cp.NOMINAL["C_Sf"], dp.C_Sr[0] / cp.NOMINAL["C_Sr"]])
         k = jnp.array([rs.ego.delay_k / max(self.max_delay, 1)], jnp.float32)
@@ -230,7 +241,7 @@ class RaceWrapper(Phase1Wrapper):
         car, s = es.cartesian_states[1], es.frenet_states[1, 0]
         slow = rs.opp_v_cap < NO_CAP
         pursuit = pure_pursuit(self._env, car, s, jnp.where(slow, 1.0, rs.opp_speed_scale), line=self.line,
-                               v_cap=rs.opp_v_cap)
+                               v_cap=rs.opp_v_cap, direction=rs.ego.direction)
         ftg = follow_the_gap(es.scans[1], rs.opp_speed_scale)
         parked = jnp.zeros(2)
         h, prev = rs.opp_h, rs.opp_prev_action
@@ -266,9 +277,12 @@ class RaceWrapper(Phase1Wrapper):
         return _distance_at(xy[0], xy[1], env.orig_x, env.orig_y, env.orig_c, env.orig_s,
                             env.height, env.width, env.resolution, jnp.asarray(env.distance_transform))
 
-    def _place(self, key, env_state, opp_type):
-        """Side-by-side or staggered start; the solo opponent is parked off the map."""
+    def _place(self, key, env_state, opp_type, direction=1.0):
+        """Side-by-side or staggered start (in the driving direction); the solo opponent is parked
+        off the map; on obstacle maps the parked car goes 2-10 m ahead where the corridor is
+        >= 1.1 m wide, toward one wall, or off the map if no such spot is found."""
         k_s, k_mode, k_side, k_gap, k_ey = jax.random.split(key, 5)
+        k_obs, k_obs_ey, k_obs_side, k_obs_yaw = jax.random.split(jax.random.fold_in(key, 29), 4)
         L = self.track_length
         s0 = jax.random.uniform(k_s) * L
         side_by_side = jax.random.bernoulli(k_mode, 0.5)
@@ -280,29 +294,48 @@ class RaceWrapper(Phase1Wrapper):
         q = half_w / 2  # a quarter of the local width
         gap = jax.random.uniform(k_gap, minval=STAGGER_M[0], maxval=STAGGER_M[1])
         ey = jax.random.uniform(k_ey, (2,), minval=-0.25 * q, maxval=0.25 * q)
-        s_opp = jnp.where(side_by_side, s0, s0 + gap)
+        s_opp = jnp.where(side_by_side, s0, s0 + direction * gap)
         ey_ego = jnp.where(side_by_side, sign * q, ey[0])
         ey_opp = jnp.where(side_by_side, -sign * q, ey[1])
-        frenet = jnp.array([[s0, ey_ego, 0.0], [jnp.mod(s_opp, L), ey_opp, 0.0]])
-        poses = self._env.track.vmap_frenet_to_cartesian_jax(frenet)
+        yaw_opp = jnp.where(direction < 0, jnp.pi, 0.0)
         solo = opp_type == OPP_SOLO
+        if self.obstacles:  # a parked car where there is room to pass it
+            cand = jnp.mod(s0 + direction * jax.random.uniform(k_obs, (8,), minval=OBSTACLE_AHEAD_M[0],
+                                                               maxval=OBSTACLE_AHEAD_M[1]), L)
+            hw = jax.vmap(self.local_half_width)(cand)
+            ok = hw >= OBSTACLE_MIN_HALF
+            i = jnp.argmax(ok)
+            side_o = jnp.where(jax.random.bernoulli(k_obs_side), 1.0, -1.0)
+            s_opp = cand[i]
+            ey_opp = side_o * jax.random.uniform(k_obs_ey, minval=0.5, maxval=1.0) * (hw[i] - cp.WIDTH / 2 - 0.08)
+            yaw_opp = yaw_opp + jax.random.uniform(k_obs_yaw, minval=-0.4, maxval=0.4)
+            side_by_side = jnp.array(False)
+            ey_ego = ey[0]
+            solo = solo | ~ok.any()
+        yaw_ego = jnp.where(direction < 0, jnp.pi, 0.0)
+        frenet = jnp.array([[s0, ey_ego, yaw_ego], [jnp.mod(s_opp, L), ey_opp, yaw_opp]])
+        poses = self._env.track.vmap_frenet_to_cartesian_jax(frenet)
         poses = poses.at[1, :2].set(jnp.where(solo, jnp.array(PARK_XY), poses[1, :2]))
         x = jnp.zeros_like(env_state.cartesian_states).at[:, jnp.array([0, 1, 4])].set(poses)
         es = env_state.replace(cartesian_states=x, last_cartesian_states=x, frenet_states=frenet,
                                last_frenet_states=frenet, prev_winding_vector=x[:, :2] - self._env.winding_point)
-        start_gap = jnp.where(solo, 0.0, self._signed_gap(frenet[1, 0], frenet[0, 0]))
-        return es, start_gap
+        start_gap = jnp.where(solo, 0.0, direction * self._signed_gap(frenet[1, 0], frenet[0, 0]))
+        return es, start_gap, solo
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey):
         k_base, k_opp, k_place, k_scan, k_noise, k_scale, k_snap = jax.random.split(key, 7)
         k_slow, k_vcap = jax.random.split(jax.random.fold_in(key, 11))  # own stream: the other draws keep theirs
         _, base = super().reset(k_base)  # ego draws and bookkeeping; both cars' vehicle params
-        p = jnp.array(OPP_MIX if self.opponents else (1.0, 0.0, 0.0, 0.0))
+        if self.obstacles:  # a parked car (pursuit with speed cap 0), else solo
+            p = jnp.array((1.0 - OBSTACLE_SHARE, 0.0, 0.0, OBSTACLE_SHARE))
+        else:
+            p = jnp.array(OPP_MIX if self.opponents else (1.0, 0.0, 0.0, 0.0))
         opp_type = jax.random.choice(k_opp, 4, p=p).astype(jnp.int32)
         if self.fixed_opponent is not None:
             opp_type = jnp.array(self.fixed_opponent, jnp.int32)
-        es, start_gap = self._place(k_place, base.env_state, opp_type)
+        es, start_gap, parked_off = self._place(k_place, base.env_state, opp_type, base.direction)
+        opp_type = jnp.where(parked_off, OPP_SOLO, opp_type).astype(jnp.int32)  # no room for an obstacle: solo
         es = self._env._scan(es, k_scan)
         stack = ob.init_stack(self._sense(k_noise, es), self.frame_stack, xp=jnp)
         ego = base.replace(env_state=es, stack=stack)
@@ -311,9 +344,10 @@ class RaceWrapper(Phase1Wrapper):
             opp_type=opp_type,
             opp_speed_scale=(jax.random.uniform(k_scale, minval=SPEED_SCALE[0], maxval=SPEED_SCALE[1])
                              if self.fixed_speed_scale is None else jnp.array(self.fixed_speed_scale, jnp.float32)),
-            opp_v_cap=jnp.where((opp_type == OPP_PURSUIT) & jax.random.bernoulli(k_slow, SLOW_SHARE),
-                                jax.random.uniform(k_vcap, minval=SLOW_SPEED[0], maxval=SLOW_SPEED[1]),
-                                NO_CAP).astype(jnp.float32),
+            opp_v_cap=(jnp.where(opp_type == OPP_PURSUIT, 0.0, NO_CAP) if self.obstacles else
+                       jnp.where((opp_type == OPP_PURSUIT) & jax.random.bernoulli(k_slow, SLOW_SHARE),
+                                 jax.random.uniform(k_vcap, minval=SLOW_SPEED[0], maxval=SLOW_SPEED[1]),
+                                 NO_CAP)).astype(jnp.float32),
             opp_snapshot=jax.random.randint(k_snap, (), 0, 1 << 20).astype(jnp.int32),
             opp_h=jnp.zeros((self.gru_dim,)),
             opp_first=jnp.array(True),
@@ -346,8 +380,9 @@ class RaceWrapper(Phase1Wrapper):
         opp_cmd, opp_h, opp_prev = self._opp_action(k_opp, rs, opp_params)
 
         _, es, rewards, _, _ = self._env.step_env(k_env, st.env_state, {"agent_0": executed, "agent_1": opp_cmd})
-        # the solo opponent stays parked off the map (speed 0 already; this pins it exactly)
-        parked = rs.opp_type == OPP_SOLO
+        # the solo opponent stays parked off the map and an obstacle where it was put (speed 0 already;
+        # this pins them exactly)
+        parked = (rs.opp_type == OPP_SOLO) | (rs.opp_v_cap == 0.0)
         cs = es.cartesian_states.at[1].set(jnp.where(parked, st.env_state.cartesian_states[1], es.cartesian_states[1]))
         es = es.replace(cartesian_states=cs)
 
@@ -359,7 +394,8 @@ class RaceWrapper(Phase1Wrapper):
         contact = es.collisions[0] | car_contact
         buffer_hit = self.wall_buffer_hit(es, st.margin)
         collided = contact | buffer_hit
-        wrong_way_count = jnp.where(jnp.cos(es.frenet_states[0, 2]) < 0.0, st.wrong_way_count + 1, 0).astype(jnp.int32)
+        wrong_way_count = jnp.where(jnp.cos(es.frenet_states[0, 2]) * st.direction < 0.0, st.wrong_way_count + 1,
+                                    0).astype(jnp.int32)
         wrong_way = (self.wrong_way_steps > 0) & (wrong_way_count >= self.wrong_way_steps)
         stall_count = jnp.where(speed < cp.STALL_SPEED, st.stall_count + 1, 0).astype(jnp.int32)
         stall = (self.stall_steps > 0) & (stall_count >= self.stall_steps)
@@ -368,15 +404,15 @@ class RaceWrapper(Phase1Wrapper):
         roll_count = jnp.where(jnp.abs(lat_accel) > tip, st.roll_count + 1, 0).astype(jnp.int32)
         rolled = self.rollover & (roll_count >= cp.ROLL_STEPS)
         failed = collided | wrong_way | stall | rolled
-        progress_m = rewards["agent_0"]
+        progress_m = rewards["agent_0"] * st.direction
         reward = step_reward(progress_m, self.track_length, action, st.prev_action, failed)
 
         # race position: opponent ahead by start_gap + its progress - ours (m)
         ep_progress = st.ep_progress + progress_m / self.track_length
-        opp_progress = rs.opp_progress + rewards["agent_1"] / self.track_length
+        opp_progress = rs.opp_progress + rewards["agent_1"] * st.direction / self.track_length
         lead = (ep_progress - opp_progress) * self.track_length - rs.start_gap  # > 0: ego ahead
         new_pos = jnp.where(lead > PASS_HYSTERESIS_M, 1, jnp.where(lead < -PASS_HYSTERESIS_M, -1, rs.position))
-        present = rs.opp_type != OPP_SOLO
+        present = (rs.opp_type != OPP_SOLO) & (rs.opp_v_cap > 0.0)  # racing rewards: moving opponents only
         passed = present & (rs.position == -1) & (new_pos == 1)
         was_passed = present & (rs.position == 1) & (new_pos == -1)
         reward = reward + OVERTAKE_REWARD * (passed.astype(jnp.float32) - was_passed.astype(jnp.float32))

@@ -5,14 +5,14 @@
 #
 #   sbatch --export=ALL,INIT_FROM=runs/phase1c/<run>/ckpt_01025.safetensors slurm/lab_finetune.sbatch
 #   options (env): ARCH (cnn_gru | mlp), FRAME_STACK (1 for cnn_gru, 3 for the MLP-3), LR (1e-4),
-#                  TRAIN_SECONDS (21600), SEED (0), VENV, MAP_DIR
+#                  TRAIN_SECONDS (37800), SEED (0), VENV, MAP_DIR
 #
 #SBATCH --job-name=rl-lab-ft
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=h100
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=06:45:00
+#SBATCH --time=11:00:00
 #SBATCH --output=slurm/logs/%x-%j.out
 
 set -euo pipefail
@@ -22,7 +22,7 @@ mkdir -p slurm/logs
 export PATH="$HOME/.local/bin:$PATH" XLA_PYTHON_CLIENT_PREALLOCATE=false WANDB_MODE=offline
 export UV_PROJECT_ENVIRONMENT="${VENV:-$PWD/.venv}"
 export F1TENTH_GYM_JAX_MAP_DIR="${MAP_DIR:-$PWD/rl/maps}"
-TRAIN_SECONDS="${TRAIN_SECONDS:-21600}"
+TRAIN_SECONDS="${TRAIN_SECONDS:-37800}"
 ARCH="${ARCH:-cnn_gru}"
 FRAME_STACK="${FRAME_STACK:-$([ "$ARCH" = cnn_gru ] && echo 1 || echo 3)}"
 echo "host $(hostname) job ${SLURM_JOB_ID:-local} commit $(git rev-parse --short HEAD) arch $ARCH init_from $INIT_FROM"
@@ -35,6 +35,7 @@ read -r -a HELDOUT <<< "$(uv run --frozen python -c 'from rl import maps as M; p
 ARGS=(--arch "$ARCH" --frame-stack "$FRAME_STACK" --init-from "$INIT_FROM"
       --lr "${LR:-1e-4}" --vf-coef 0.1 --ent-coef 0.005 --seed "${SEED:-0}" --num-envs 2048
       --max-delay 6 --rollover true --steer-asym true --friction-lo 1.1 --friction-hi 1.5 --max-laps 5
+      --random-direction true --accel-lo 5.5 --accel-hi 6.5
       --train-maps "${TRAIN[@]}" --heldout-maps "${HELDOUT[@]}" --wandb-mode offline)
 
 # No throughput probe: compiling 32 maps takes longer than a short probe, which then sized the budget from

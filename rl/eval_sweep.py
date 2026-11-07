@@ -74,7 +74,7 @@ def run(checkpoints, settings, episodes, max_steps, out_dir: pathlib.Path, suite
     """``lab_physics``: evaluate under the lab fine-tune's physics (rollover,
     carpet friction, 0-240 ms delay) whatever the checkpoints trained with."""
     from . import car_params as cp
-    from .evaluate import friction_from, make_evaluator, wrapper_kwargs_from
+    from .evaluate import accel_from, friction_from, make_evaluator, wrapper_kwargs_from
     from .train_ppo import load_checkpoint
 
     groups = SUITES[suite]
@@ -88,16 +88,16 @@ def run(checkpoints, settings, episodes, max_steps, out_dir: pathlib.Path, suite
     model_cfg = model_cfg_from(loaded[0][1]["config"])
     map_names = tuple(n for names in groups.values() for n in names)
     cfg = loaded[-1][1]["config"]
-    wrapper_kwargs, friction = wrapper_kwargs_from(cfg), friction_from(cfg)
+    wrapper_kwargs, friction, accel = wrapper_kwargs_from(cfg), friction_from(cfg), accel_from(cfg)
     if lab_physics:
         wrapper_kwargs.update(rollover=True, steer_asym=True, max_delay=cp.LAB_MAX_DELAY_STEPS)
-        friction = cp.LAB_FRICTION
+        friction, accel = cp.LAB_FRICTION, cp.LAB_ACCEL
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = []
     for setting in settings:
         t0 = time.time()
         evaluate = make_evaluator(map_names, episodes, max_steps, randomize=(setting == "randomized"),
-                                  model_cfg=model_cfg, wrapper_kwargs=wrapper_kwargs, friction=friction)
+                                  model_cfg=model_cfg, wrapper_kwargs=wrapper_kwargs, friction=friction, accel=accel)
         print(f"[{setting}] evaluator built in {time.time() - t0:.0f}s", flush=True)
         for path, ck in loaded:
             rep = evaluate(ck["actor_params"], ck["normalizer"])

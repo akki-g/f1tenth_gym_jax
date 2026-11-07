@@ -290,9 +290,71 @@ def test_racing_line_inside_corridor_and_shorter():
         assert np.abs(ey).max() > 0.05, name  # it does leave the centerline
 
 
-@pytest.mark.parametrize("name", ["LastRace2", "LastRace2Rev", "RaceLike6009", "RaceLike6121", "Trap7002", "Duct1002"])
+@pytest.mark.parametrize("name", ["LastRace2", "LastRace2Rev", "RaceLike20010", "RaceLike20012", "Trap50023", "Duct1002"])
 def test_slow_and_normal_pursuit_lap_on_racing_line(name):
     collided, laps, v = _line_lap(name, 1.0, 1.0)  # slow car: 1 m/s cap
     assert not collided and laps >= 1.0 and 0.8 <= v <= 1.05, (name, collided, laps, v)
     collided, laps, v = _line_lap(name, 1.0, 100.0)  # curvature-limited speed
     assert not collided and laps >= 1.0 and v > 1.2, (name, collided, laps, v)
+
+
+
+# ---------------------------------------------------------------------------
+# Obstacles, direction, and the MLP in the race env
+# ---------------------------------------------------------------------------
+def _race_env(name, **kw):
+    from f1tenth_gym_jax.envs import F110Env
+    from rl import maps as M
+    from rl import race as RC
+    from rl.domain_rand import make_param
+
+    M.use_map_dir(M.DEFAULT_MAP_DIR)
+    M.prepare_maps(M.DEFAULT_MAP_DIR, (name,))
+    env = F110Env(2, make_param(name, randomize=True, scan_other_agents=True))
+    return RC.RaceWrapper(env, True, opponents=True, frame_stack=kw.pop("frame_stack", 1), **kw)
+
+
+def test_obstacles_parked_where_passable():
+    from rl import race as RC
+
+    w = _race_env("RaceLike20010", obstacles=True)
+    obs, rs = jax.vmap(w.reset)(jax.random.split(jax.random.PRNGKey(0), 32))
+    types = np.asarray(rs.opp_type)
+    assert set(types.tolist()) <= {RC.OPP_SOLO, RC.OPP_PURSUIT} and (types == RC.OPP_PURSUIT).mean() > 0.5
+    parked = types == RC.OPP_PURSUIT
+    assert np.all(np.asarray(rs.opp_v_cap)[parked] == 0.0)
+    s_obs = np.asarray(rs.ego.env_state.frenet_states[:, 1, 0])[parked]
+    hw = np.asarray(jax.vmap(w.local_half_width)(jnp.asarray(s_obs)))
+    assert np.all(hw >= RC.OBSTACLE_MIN_HALF - 1e-6)
+    i = int(np.argmax(parked))
+    r1 = jax.tree.map(lambda x: x[i], rs)
+    xy0 = np.asarray(r1.ego.env_state.cartesian_states[1, :2])
+    for t in range(10):
+        _, r1, _, done, _ = w.step(jax.random.PRNGKey(t), r1, jnp.array([-1.0, 0.0]))
+    assert np.allclose(np.asarray(r1.ego.env_state.cartesian_states[1, :2]), xy0, atol=1e-4)  # it never moves
+
+
+def test_mlp_race_layout_and_direction():
+    """The MLP's race env keeps phase 1's observation (3 frames, no privileged block); with random
+    direction both cars face the same way and forward driving counts as progress."""
+    from rl import obs as ob
+
+    w = _race_env("RaceLike20010", privileged=False, frame_stack=3, random_direction=True)
+    assert w.obs_dim == ob.obs_dim(3, w.num_beams)
+    obs, rs = jax.vmap(w.reset)(jax.random.split(jax.random.PRNGKey(1), 16))
+    assert obs.shape == (16, w.obs_dim)
+    d = np.asarray(rs.ego.direction)
+    assert set(d.tolist()) == {-1.0, 1.0}
+    yaw_err = np.asarray(rs.ego.env_state.frenet_states[:, :, 2])
+    present = np.asarray(rs.opp_type) != 0
+    assert np.all(np.cos(yaw_err[:, 0]) * d > 0.9)  # the ego faces the driving direction
+    assert np.all((np.cos(yaw_err[:, 1]) * d)[present] > 0.9)  # so does the opponent
+    i = int(np.argmax(d < 0))
+    r1 = jax.tree.map(lambda x: x[i], rs)
+    total = 0.0
+    for t in range(15):
+        _, r1, r, done, info = w.step(jax.random.PRNGKey(t), r1, jnp.array([-0.7, 0.0]))
+        total += float(r)
+        if bool(done):
+            break
+    assert not bool(info["wrong_way"]) and float(r1.ego.ep_progress) >= 0.0

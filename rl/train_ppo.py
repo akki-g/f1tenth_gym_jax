@@ -59,7 +59,8 @@ _BOOKKEEPING = ("runs_root", "wandb_mode", "wandb_project", "time_limit", "map_d
 # Fields added for the lab fine-tune: left out of the run hash at their defaults,
 # so earlier runs keep their directories (and resume).
 _HASH_OPTIONAL = {"rollover": False, "friction_lo": 0.0, "friction_hi": 0.0, "max_laps": cp.MAX_LAPS,
-                  "steer_asym": False}
+                  "steer_asym": False, "random_direction": False, "accel_lo": 0.0, "accel_hi": 0.0,
+                  "race_mode": "opponents"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,6 +110,10 @@ class Config:
     stall_steps: int = cp.STALL_STEPS
     rollover: bool = False  # end episodes on tipping (car_params TIP_*; lab fine-tune)
     steer_asym: bool = False  # left/right steering gains per episode (car_params STEER_GAIN_*; lab fine-tune)
+    random_direction: bool = False  # each episode runs its track one way or the other round
+    accel_lo: float = 0.0  # accel_hi > 0: acceleration / braking limit spread over the maps (lab: 5.5-6.5)
+    accel_hi: float = 0.0
+    race_mode: str = "opponents"  # race: opponents | obstacles (a parked car) | mixed (alternate maps)
     friction_lo: float = 0.0  # friction_hi > 0: mu range [lo, hi] replaces car_params' (lab: 1.1-1.5)
     friction_hi: float = 0.0
     max_laps: int = cp.MAX_LAPS  # laps per training episode (evaluation always uses 1)
@@ -132,7 +137,15 @@ class Config:
         return {"wall_margin": self.wall_margin, "wall_margin_noise": self.wall_margin_noise,
                 "wrong_way_steps": self.wrong_way_steps, "stall_steps": self.stall_steps,
                 "frame_stack": self.frame_stack, "max_delay": self.max_delay, "rollover": self.rollover,
-                "steer_asym": self.steer_asym}
+                "steer_asym": self.steer_asym, "random_direction": self.random_direction}
+
+    def accel(self) -> tuple:
+        return (self.accel_lo, self.accel_hi) if self.accel_hi > 0 else ()
+
+    def obstacle_maps(self) -> tuple:
+        if not self.race or self.race_mode == "opponents":
+            return ()
+        return tuple(self.train_maps if self.race_mode == "obstacles" else self.train_maps[1::2])
 
     def friction(self) -> tuple:
         return (self.friction_lo, self.friction_hi) if self.friction_hi > 0 else ()
@@ -141,7 +154,7 @@ class Config:
         from .race import PRIV_DIM
 
         cfg = {k: getattr(self, k) for k in MODEL_KEYS if k != "priv_dim"}
-        cfg["priv_dim"] = PRIV_DIM if self.race else 0
+        cfg["priv_dim"] = PRIV_DIM if (self.race and self.arch == "cnn_gru") else 0
         return cfg
 
     def validate(self):
@@ -151,10 +164,10 @@ class Config:
             raise ValueError("mlp_layers must be >= 1")
         if self.arch not in ("mlp", "cnn_gru"):
             raise ValueError(f"arch must be mlp or cnn_gru, not {self.arch!r}")
-        if self.race and self.arch != "cnn_gru":
-            raise ValueError("phase 2 (race) trains the cnn_gru")
-        if self.init_from and self.race and self.arch != "cnn_gru":
-            raise ValueError("phase 2 init_from loads a cnn_gru checkpoint")
+        if self.race_mode not in ("opponents", "obstacles", "mixed"):
+            raise ValueError(f"race_mode must be opponents, obstacles or mixed, not {self.race_mode!r}")
+        if self.race and self.arch not in ("cnn_gru", "mlp"):
+            raise ValueError("race mode trains the cnn_gru or the mlp")
         if self.friction_hi > 0 and not 0 < self.friction_lo < self.friction_hi:
             raise ValueError("friction range needs 0 < friction_lo < friction_hi")
         if self.max_laps < 1:
@@ -366,7 +379,8 @@ def make_mlp_trainer(config: Config, env: M.MultiMapEnv):
         action, u, logp = sample_action(k_act, mean, log_std)
         value = critic_net.apply(r.critic.params, nobs)
         obs, env_states, reward, done, info = env.step(k_env, r.env_states, action)
-        t = Transition(nobs, u, logp, value, reward, done, r.obs[:, NORM_SLICE], {k: info[k] for k in INFO_KEYS},
+        t = Transition(nobs, u, logp, value, reward, done, r.obs[:, NORM_SLICE],
+                       {k: info[k] for k in INFO_KEYS + (RACE_INFO_KEYS if config.race else ())},
                        r.h, r.first)
         return r._replace(env_states=env_states, obs=obs, key=key, first=done), t
 
@@ -691,9 +705,12 @@ def train(config: Config) -> pathlib.Path:
 
     print(f"run dir: {run_dir}  ({config.num_updates} updates, backend {jax.default_backend()})", flush=True)
     t_build = time.time()
-    race = dict(opponents=True, gru_dim=config.gru_dim, snapshot_model=race_model(config)) if config.race else None
+    gru = config.arch == "cnn_gru"
+    race = (dict(opponents=True, gru_dim=config.gru_dim, snapshot_model=race_model(config) if gru else None,
+                 privileged=gru) if config.race else None)
     env = M.MultiMapEnv(config.train_maps, config.num_envs, randomize=config.randomize,
                         wrapper_kwargs={**config.wrapper_kwargs(), "max_laps": config.max_laps}, race=race,
+                        accel_range=config.accel(), obstacle_maps=config.obstacle_maps(),
                         num_beams=config.num_beams, **friction_overrides(config.friction(), config.randomize),
                         **steer_overrides(config.steer_asym))
     init, update, _, internals = make_trainer(config, env)
@@ -706,14 +723,15 @@ def train(config: Config) -> pathlib.Path:
         best_score = best_info.get("best_score", -np.inf)
         print(f"resumed from {latest} at update {int(runner.update)}", flush=True)
     elif config.init_from:
-        runner, copied = load_init_from(config.init_from, runner, internals.init_pool if config.race else None,
-                                        copy_critic=not config.race)
+        privileged = config.race and gru
+        runner, copied = load_init_from(config.init_from, runner, internals.init_pool if privileged else None,
+                                        copy_critic=not privileged)
         print(f"initialized from {config.init_from}: {len(copied)} tensors "
-              f"({'critic head new' if config.race else 'critic head copied'})", flush=True)
-    if config.race and latest.exists():  # the pool is not checkpointed: restart it from the resumed policy
+              f"({'critic head new' if privileged else 'critic head copied'})", flush=True)
+    if config.race and gru and latest.exists():  # the pool is not checkpointed: restart it from the resumed policy
         runner = runner._replace(opp_pool=internals.init_pool(runner.actor.params, runner.normalizer))
     evaluate = make_evaluator(config.heldout_maps, config.eval_episodes, config.eval_max_steps,
-                              wrapper_kwargs=config.wrapper_kwargs(), friction=config.friction(),
+                              wrapper_kwargs=config.wrapper_kwargs(), friction=config.friction(), accel=config.accel(),
                               randomize=False, model_cfg=config.model_cfg())
 
     wandb.init(project=config.wandb_project, name=run_dir.name, id=f"{run_dir.name}", resume="allow",
@@ -737,7 +755,7 @@ def train(config: Config) -> pathlib.Path:
         while int(runner.update) < config.num_updates:
             t0 = time.time()
             runner, metrics, episodes = update(runner)
-            if config.race and int(runner.update) % config.snapshot_every == 0:
+            if config.race and gru and int(runner.update) % config.snapshot_every == 0:
                 n_snap = int(runner.update) // config.snapshot_every
                 slot = 1 + (n_snap - 1) % config.snapshot_pool  # slot 0 keeps the starting model
                 runner = runner._replace(opp_pool=add_snapshot(runner.opp_pool, slot, runner.actor.params,

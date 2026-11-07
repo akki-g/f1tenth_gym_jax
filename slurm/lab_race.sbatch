@@ -26,10 +26,12 @@ mkdir -p slurm/logs
 : "${INIT_FROM:?set INIT_FROM to a phase-1c checkpoint}"
 export PATH="$HOME/.local/bin:$PATH" XLA_PYTHON_CLIENT_PREALLOCATE=false WANDB_MODE=offline
 # H100 or V100 (16/32 GB), whichever frees up first: CUDA 13 dropped Volta, so on a V100 the same
-# JAX runs from its CUDA 12 build (.venv-cu12, as in train_phase1.sbatch); a run uses ~8 GB.
+# JAX runs from its CUDA 12 build with cuDNN pinned to 9.8 (.venv-cu12b: jax-cuda12-plugin 0.7.2,
+# nvidia-cudnn-cu12==9.8.0.87; cuDNN 9.28, as in .venv-cu12, has no Volta kernels and every
+# convolution fails). A run uses ~8 GB.
 case "$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)" in
   *H100*) DEFAULT_VENV="$PWD/.venv" ;;
-  *)      DEFAULT_VENV="$PWD/.venv-cu12" ;;
+  *)      DEFAULT_VENV="$PWD/.venv-cu12b" ;;
 esac
 export UV_PROJECT_ENVIRONMENT="${VENV:-$DEFAULT_VENV}"
 export F1TENTH_GYM_JAX_MAP_DIR="${MAP_DIR:-$PWD/rl/maps}"

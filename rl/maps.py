@@ -784,13 +784,30 @@ def generate_race_like_track(seed: int):
 # Hand-drawn tracks (the team's sketches, digitized: walls, centerline, scale in drawn_tracks.npz)
 # ---------------------------------------------------------------------------
 DRAWN_FILE = pathlib.Path(__file__).resolve().parent / "drawn_tracks.npz"
-DRAWN_BASES = ("Drawn1", "Drawn2", "Drawn3", "Drawn4")  # IMG_0055, then IMG_0056 top / middle / bottom
+DRAWN_BASES = ("Drawn3",)  # IMG_0056 middle (the other drawings: sketch_track, from hand-digitized polylines)
 # per drawing: the extra scale that brings its narrowest neck to ~0.85-0.95 m (the open parts, which
 # would come out 3-7 m wide, are capped at DRAWN_MAX_WIDTH); variant letter: (scale, mirrored),
 # a-c train, h held-out
-DRAWN_BASE_SCALE = {"Drawn1": 1.6, "Drawn2": 1.13, "Drawn3": 1.8, "Drawn4": 1.35}
+DRAWN_BASE_SCALE = {"Drawn3": 1.8}
 DRAWN_MAX_WIDTH = 2.0  # m, the corridor cap (the open parts of the sketches are much wider)
 DRAWN_VARIANTS = {"a": (1.0, False), "b": (1.1, True), "c": (1.2, False), "h": (1.05, True)}
+
+
+def _cap_corridor(free, lo, res, xy, max_width):
+    """``free`` with the corridor along the closed line ``xy`` cut down to at most ``max_width``:
+    only the corridor within half of it of the line stays free, walled in by a LAB_WALL band
+    (where the corridor is narrower, its walls are unchanged). Trims evenly when ``xy`` runs
+    along the corridor's middle."""
+    from scipy import ndimage as ndi
+
+    h_px, w_px = free.shape
+    dense = _resample_closed(xy, res / 2)
+    on_line = np.zeros_like(free)
+    ij = np.clip(np.round((dense - lo) / res - 0.5).astype(int), 0, [w_px - 1, h_px - 1])
+    on_line[ij[:, 1], ij[:, 0]] = True
+    labels, _ = ndi.label(free & (ndi.distance_transform_edt(~on_line) * res <= max_width / 2 - res))
+    corridor = labels == labels[ij[0, 1], ij[0, 0]]
+    return corridor | (ndi.distance_transform_edt(~corridor) * res > LAB_WALL)
 
 
 def drawn_track(name: str):
@@ -825,22 +842,128 @@ def drawn_track(name: str):
     xy = np.c_[path[:, 1] * scale, (H - path[:, 0]) * scale]
     xy = _resample_closed(_smooth_closed(_resample_closed(xy, 0.05), 31), 0.1)  # 1.5 m smoothing: a progress reference
     # The sketches' corridors vary a lot in width; scaled so the necks are drivable, the open parts
-    # come out 3-7 m wide. Cap them at DRAWN_MAX_WIDTH: keep the corridor within half of it of the
-    # centerline, then wall in what is left with a LAB_WALL band (narrow parts keep the drawn walls).
-    dense = _resample_closed(xy, res / 2)
-    on_line = np.zeros_like(free)
-    ij = np.clip(np.round((dense - lo) / res - 0.5).astype(int), 0, [w_px - 1, h_px - 1])
-    on_line[ij[:, 1], ij[:, 0]] = True
-    labels, _ = ndi.label(free & (ndi.distance_transform_edt(~on_line) * res <= DRAWN_MAX_WIDTH / 2 - res))
-    corridor = labels == labels[ij[0, 1], ij[0, 0]]
-    free = corridor | (ndi.distance_transform_edt(~corridor) * res > LAB_WALL)
+    # come out 3-7 m wide: capped at DRAWN_MAX_WIDTH (narrow parts keep the drawn walls).
+    free = _cap_corridor(free, lo, res, xy, DRAWN_MAX_WIDTH)
     g = _measure_track(free, lo, res, xy)
     g["scale"] = scale
     return g
 
 
 DRAWN_TRAIN_MAPS = tuple(f"{b}{v}" for b in DRAWN_BASES for v in "abc")
-DRAWN_HELDOUT_MAPS = ("Drawn1h", "Drawn3h")
+DRAWN_HELDOUT_MAPS = ("Drawn3h",)
+
+
+# ---------------------------------------------------------------------------
+# The drawings digitized by hand as polylines (rl/sketch_tracks.py, from the user's
+# CARVEL/draw_track_maps.py): 1-3 = IMG_0056 top / middle / bottom, 4 = IMG_0055. Sketch 2 is
+# Drawn3's drawing and stays out: no scale gets its 5 m open area under SKETCH_MAX_GAP with its
+# hook passable.
+SKETCH_IDS = (1, 3, 4)
+SKETCH_MAX_GAP = 2.6  # m
+# m per sketch pixel: the narrowest neck 0.9 m, scaled down until the widest gap (95th percentile
+# of the widths) is SKETCH_MAX_GAP but not below a 0.8 m neck; what is still wider is capped
+# (only sketch 4: 0.8 m neck)
+SKETCH_SCALE = {1: 0.0258, 3: 0.0173, 4: 0.0162}
+# variant letter: (scale, mirrored); a-d train, h held-out
+SKETCH_VARIANTS = {"a": (1.0, False), "b": (1.0, True), "c": (1.1, False), "d": (1.1, True), "h": (1.05, True)}
+
+
+def _densify(poly, spacing):
+    """An open polyline resampled so no two consecutive points are more than ``spacing`` apart."""
+    seg = np.diff(poly, axis=0)
+    n = np.maximum(np.ceil(np.hypot(*seg.T) / spacing).astype(int), 1)
+    return np.vstack([np.linspace(a, b, k, endpoint=False) for a, b, k in zip(poly[:-1], poly[1:], n)] + [poly[-1:]])
+
+
+def _loop_centerline(corridor, step=2, alpha=0.3):
+    """A closed path around the island through the corridor's middle, as (row, col) grid coordinates:
+    Dijkstra on the corridor grid (every ``step`` cells) with a cost that grows near the walls, from
+    one side of a cut across the corridor (island centre through the widest point) to the other."""
+    from scipy import ndimage as ndi
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import dijkstra
+
+    C = corridor[::step, ::step]
+    clear = ndi.distance_transform_edt(C)
+    nodes = np.argwhere(C)
+    idx = -np.ones(C.shape, int)
+    idx[C] = np.arange(len(nodes))
+    centre = np.argwhere(ndi.binary_fill_holes(C) & ~C).mean(axis=0)
+    p0 = nodes[np.argmax(clear[C])]
+    d = (p0 - centre) / np.linalg.norm(p0 - centre)
+    rel = nodes - centre
+    along, perp = rel @ d, rel @ np.array([-d[1], d[0]])
+    ray = np.zeros(C.shape, bool)
+    ray[tuple(nodes[(np.abs(perp) <= 0.8) & (along > 0)].T)] = True
+    rlab, _ = ndi.label(ray, structure=np.ones((3, 3)))
+    cut_mask = rlab == rlab[tuple(p0)]  # the cut: the ray's corridor crossing through p0
+    cut = cut_mask[tuple(nodes.T)]
+    near = ndi.binary_dilation(cut_mask, structure=np.ones((5, 5)))[tuple(nodes.T)] & ~cut
+    src, dst = np.flatnonzero(near & (perp > 0)), np.flatnonzero(near & (perp < 0))
+    cost = 1.0 + alpha * (clear.max() / np.maximum(clear[C], 0.5)) ** 2
+    rows, cols, w = [], [], []
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        b = nodes + [dy, dx]
+        ok = (b[:, 0] >= 0) & (b[:, 0] < C.shape[0]) & (b[:, 1] >= 0) & (b[:, 1] < C.shape[1])
+        a, b = nodes[ok], b[ok]
+        i, j = idx[a[:, 0], a[:, 1]], idx[b[:, 0], b[:, 1]]
+        good = (j >= 0) & ~cut[i] & ~cut[np.maximum(j, 0)]
+        i, j = i[good], j[good]
+        ww = np.hypot(dy, dx) * 0.5 * (cost[i] + cost[j])
+        rows += [i, j]
+        cols += [j, i]
+        w += [ww, ww]
+    g = coo_matrix((np.concatenate(w), (np.concatenate(rows), np.concatenate(cols))), shape=(len(nodes),) * 2).tocsr()
+    dist, pred, _ = dijkstra(g, indices=src, min_only=True, return_predecessors=True)
+    path = [dst[np.argmin(dist[dst])]]
+    while pred[path[-1]] >= 0:
+        path.append(pred[path[-1]])
+    return nodes[path[::-1]].astype(float) * step
+
+
+def sketch_track(name: str, scale: float | None = None, max_width: float | None = SKETCH_MAX_GAP):
+    """A track from the hand-digitized polylines, e.g. "Sketch4b": the outer wall, the island and
+    its spurs (Catmull-Rom smoothed as in draw_track_maps.py) become 0.30 m ducts, SKETCH_SCALE m
+    per sketch pixel times the variant's scale, mirrored for some variants. Centerline: the path
+    around the island through the corridor's middle, smoothed over ~1 m; stretches still wider than
+    ``max_width`` capped (most of all sketch 4)."""
+    from matplotlib.path import Path
+    from scipy import ndimage as ndi
+    from scipy.spatial import cKDTree
+
+    from rl.sketch_tracks import SKETCHES, smooth_boundary
+
+    sid, var = int(name[len("Sketch"):-1]), name[-1]
+    k, mirror = SKETCH_VARIANTS[var]
+    s = (SKETCH_SCALE[sid] if scale is None else scale) * k
+    t = SKETCHES[sid]
+    curves = [smooth_boundary(t["outer"]), smooth_boundary(t["inner"])]
+    curves += [smooth_boundary(p, closed=False) for p in t["spurs"]]
+    y_top = curves[0][:, 1].max()
+    curves = [np.c_[c[:, 0] * s * (-1 if mirror else 1), (y_top - c[:, 1]) * s] for c in curves]  # y up, metres
+    res = GEN_RESOLUTION
+    pts = np.vstack([_densify(c, res / 4) for c in curves])
+    lo, hi = pts.min(axis=0) - LAB_WALL - GEN_MARGIN, pts.max(axis=0) + LAB_WALL + GEN_MARGIN
+    w_px, h_px = np.ceil((hi - lo) / res).astype(int)
+    gx, gy = np.meshgrid(lo[0] + (np.arange(w_px) + 0.5) * res, lo[1] + (np.arange(h_px) + 0.5) * res)
+    P = np.c_[gx.ravel(), gy.ravel()]
+    free = (cKDTree(pts).query(P)[0] > LAB_WALL / 2).reshape(h_px, w_px)
+    region = (Path(curves[0]).contains_points(P) & ~Path(curves[1]).contains_points(P)).reshape(h_px, w_px)
+    labels, n = ndi.label(free & region)
+    corridor = labels == 1 + np.argmax(np.bincount(labels.ravel(), minlength=n + 1)[1:])
+    rc = _loop_centerline(corridor)
+    xy = lo + (rc[:, ::-1] + 0.5) * res
+    xy = _resample_closed(_smooth_closed(_resample_closed(xy, 0.05), 21), 0.1)  # ~1 m: clears the hooks
+    if max_width is not None:  # trimmed evenly about the corridor's medial line (high wall cost)
+        mid = lo + (_loop_centerline(corridor, step=1, alpha=20.0)[:, ::-1] + 0.5) * res
+        free = _cap_corridor(free, lo, res, _smooth_closed(_resample_closed(mid, 0.05), 5), max_width)
+    g = _measure_track(free, lo, res, xy)
+    g["scale"] = s
+    return g
+
+
+SKETCH_TRAIN_MAPS = tuple(f"Sketch{i}{v}" for i in SKETCH_IDS for v in "abcd")
+SKETCH_HELDOUT_MAPS = ("Sketch4h",)
 
 
 def race_like_name(seed: int) -> str:
@@ -1022,8 +1145,9 @@ TRAP_HELDOUT_MAPS = tuple(trap_name(s) for s in TRAP_HELDOUT_SEEDS)
 TRAP_UNSEEN_MAPS = tuple(trap_name(s) for s in TRAP_UNSEEN_SEEDS)
 # Lab fine-tune (32 maps, 64 envs each): the last race's track both ways, 12 tracks like it, the 4 hand
 # drawings in 3 variants each, and 6 speed-trap loops. Selection: held-out race-like, drawn and trap tracks.
-LAB_FT_TRAIN_MAPS = LAST_RACE_MAPS + RACE_LIKE_TRAIN_MAPS[:12] + DRAWN_TRAIN_MAPS + TRAP_TRAIN_MAPS[:6]
-LAB_FT_HELDOUT_MAPS = RACE_LIKE_HELDOUT_MAPS[:3] + DRAWN_HELDOUT_MAPS + TRAP_HELDOUT_MAPS
+LAB_FT_TRAIN_MAPS = (LAST_RACE_MAPS + RACE_LIKE_TRAIN_MAPS[:12] + DRAWN_TRAIN_MAPS + SKETCH_TRAIN_MAPS
+                     + TRAP_TRAIN_MAPS[:3])
+LAB_FT_HELDOUT_MAPS = RACE_LIKE_HELDOUT_MAPS[:3] + DRAWN_HELDOUT_MAPS + SKETCH_HELDOUT_MAPS + TRAP_HELDOUT_MAPS
 LAB_EVAL_UNSEEN_MAPS = RACE_LIKE_UNSEEN_MAPS + TRAP_UNSEEN_MAPS
 assert not set(LAB_FT_TRAIN_MAPS) & set(LAB_FT_HELDOUT_MAPS + LAB_EVAL_UNSEEN_MAPS)
 assert not set(LAB_FT_HELDOUT_MAPS) & set(LAB_EVAL_UNSEEN_MAPS)
@@ -1058,6 +1182,7 @@ def prepare_maps(map_dir: os.PathLike = DEFAULT_MAP_DIR, maps=TRAIN_MAPS + HELDO
                   for s in RACE_LIKE_TRAIN_SEEDS + RACE_LIKE_HELDOUT_SEEDS + RACE_LIKE_UNSEEN_SEEDS})
     seeds.update({trap_name(s): (generate_trap_track, s) for s in TRAP_TRAIN_SEEDS + TRAP_HELDOUT_SEEDS + TRAP_UNSEEN_SEEDS})
     seeds.update({n: (drawn_track, n) for n in DRAWN_TRAIN_MAPS + DRAWN_HELDOUT_MAPS})
+    seeds.update({n: (sketch_track, n) for n in SKETCH_TRAIN_MAPS + SKETCH_HELDOUT_MAPS})
     for name in maps:
         if name in seeds:
             gen, seed = seeds[name]

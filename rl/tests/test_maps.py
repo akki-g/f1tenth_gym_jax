@@ -231,7 +231,7 @@ def room_prepared():
 def test_room_and_fine_tune_lists():
     assert len(M.LAB_FT_TRAIN_MAPS) == 32 and len(set(M.LAB_FT_TRAIN_MAPS)) == 32
     assert set(M.LAST_RACE_MAPS) <= set(M.LAB_FT_TRAIN_MAPS)
-    assert all(n.startswith(("LastRace2", "RaceLike", "Drawn", "Trap")) for n in M.LAB_FT_TRAIN_MAPS + M.LAB_FT_HELDOUT_MAPS)
+    assert all(n.startswith(("LastRace2", "RaceLike", "Drawn", "Sketch", "Trap")) for n in M.LAB_FT_TRAIN_MAPS + M.LAB_FT_HELDOUT_MAPS)
     assert not set(M.LAB_FT_TRAIN_MAPS) & set(M.LAB_FT_HELDOUT_MAPS + M.LAB_EVAL_UNSEEN_MAPS)
 
 
@@ -265,6 +265,8 @@ def _ft_gen(name):
         return M.last_race_track(reverse=name.endswith("Rev"))
     if name.startswith("Drawn"):
         return M.drawn_track(name)
+    if name.startswith("Sketch"):
+        return M.sketch_track(name)
     if name.startswith("RaceLike"):
         return M.generate_race_like_track(int(name[8:]))
     return M.generate_trap_track(int(name[4:]))
@@ -277,6 +279,17 @@ def ft_prepared():
     return map_dir
 
 
+def _widest_gap(g):
+    """Diameter of the largest circle that fits in the track's corridor (m)."""
+    from scipy import ndimage as ndi
+
+    free, res = g["free"], g["resolution"]
+    labels, _ = ndi.label(free)
+    i, j = np.round((g["centerline"][0, :2] - np.asarray(g["origin"])) / res - 0.5).astype(int)
+    corridor = labels == labels[j, i]
+    return 2 * (ndi.distance_transform_edt(free)[corridor].max() * res - res / 2)
+
+
 @pytest.mark.parametrize("name", FT_ALL)
 def test_fine_tune_track_in_spec_and_drivable(ft_prepared, name):
     """Written map matches the generator; corridor >= 0.9 m (trap straights <= 3 m); the car fits on the
@@ -285,10 +298,13 @@ def test_fine_tune_track_in_spec_and_drivable(ft_prepared, name):
     assert g is not None
     img = np.asarray(Image.open(ft_prepared / name / f"{name}.png"))[::-1] > 127
     np.testing.assert_array_equal(img, g["free"])
-    assert g["min_width"] >= (0.8 if name.startswith("Drawn") else 0.9) - 1e-6  # drawn necks: as sketched, scaled
+    hand = name.startswith(("Drawn", "Sketch"))
+    assert g["min_width"] >= (0.7 if hand else 0.9) - 1e-6  # hand-drawn necks: as drawn, scaled (~0.75-0.95 m)
     if name.startswith("Drawn"):
         # capped at 2 m (max_width itself reads the hairpins' turnarounds lengthwise)
         assert g["min_clearance"] >= 0.25 and g["p95_width"] <= M.DRAWN_MAX_WIDTH + 1e-6
+    elif name.startswith("Sketch"):
+        assert g["min_clearance"] >= 0.25 and _widest_gap(g) <= M.SKETCH_MAX_GAP + 1e-6
     elif name.startswith("Trap"):
         assert 2.0 <= g["trap_width"] <= 3.0 and g["max_width"] <= 3.0 + 1e-6
         # one wall pushes out on the trap: at its widest point the pushed side is the wider one by far

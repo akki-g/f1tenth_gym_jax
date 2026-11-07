@@ -231,7 +231,7 @@ def room_prepared():
 def test_room_and_fine_tune_lists():
     assert len(M.LAB_FT_TRAIN_MAPS) == 32 and len(set(M.LAB_FT_TRAIN_MAPS)) == 32
     assert set(M.LAST_RACE_MAPS) <= set(M.LAB_FT_TRAIN_MAPS)
-    assert all(n.startswith(("LastRace2", "RaceLike", "Trap")) for n in M.LAB_FT_TRAIN_MAPS + M.LAB_FT_HELDOUT_MAPS)
+    assert all(n.startswith(("LastRace2", "RaceLike", "Drawn", "Trap")) for n in M.LAB_FT_TRAIN_MAPS + M.LAB_FT_HELDOUT_MAPS)
     assert not set(M.LAB_FT_TRAIN_MAPS) & set(M.LAB_FT_HELDOUT_MAPS + M.LAB_EVAL_UNSEEN_MAPS)
 
 
@@ -263,6 +263,8 @@ FT_ALL = tuple(dict.fromkeys(M.LAB_FT_TRAIN_MAPS + M.LAB_FT_HELDOUT_MAPS + M.LAB
 def _ft_gen(name):
     if name.startswith("LastRace2"):
         return M.last_race_track(reverse=name.endswith("Rev"))
+    if name.startswith("Drawn"):
+        return M.drawn_track(name)
     if name.startswith("RaceLike"):
         return M.generate_race_like_track(int(name[8:]))
     return M.generate_trap_track(int(name[4:]))
@@ -283,8 +285,11 @@ def test_fine_tune_track_in_spec_and_drivable(ft_prepared, name):
     assert g is not None
     img = np.asarray(Image.open(ft_prepared / name / f"{name}.png"))[::-1] > 127
     np.testing.assert_array_equal(img, g["free"])
-    assert g["min_width"] >= 0.9 - 1e-6
-    if name.startswith("Trap"):
+    assert g["min_width"] >= (0.8 if name.startswith("Drawn") else 0.9) - 1e-6  # drawn necks: as sketched, scaled
+    if name.startswith("Drawn"):
+        # capped at 2 m (max_width itself reads the hairpins' turnarounds lengthwise)
+        assert g["min_clearance"] >= 0.25 and g["p95_width"] <= M.DRAWN_MAX_WIDTH + 1e-6
+    elif name.startswith("Trap"):
         assert 2.0 <= g["trap_width"] <= 3.0 and g["max_width"] <= 3.0 + 1e-6
         # one wall pushes out on the trap: at its widest point the pushed side is the wider one by far
         wl, wr = g["wall_offsets"].T

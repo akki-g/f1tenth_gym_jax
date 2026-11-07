@@ -626,6 +626,15 @@ def build_duct_track(walls, waypoints, reverse=False, rugged=0.0, rng=None, clos
     xy = _periodic_spline(np.asarray(waypoints, float))
     if reverse:
         xy = np.vstack([xy[:1], xy[:0:-1]])
+    return _measure_track(free, lo, res, xy)
+
+
+def _measure_track(free, lo, res, xy):
+    """The generate_*_track dict for a rendered map ``free`` (origin ``lo``, resolution ``res``)
+    and a closed centerline ``xy``: corridor widths across along each normal, clearance, radius."""
+    from scipy.ndimage import distance_transform_edt
+
+    h_px, w_px = free.shape
     # corridor cross-section: march along the normal to the first wall on each side
     t = np.roll(xy, -1, axis=0) - np.roll(xy, 1, axis=0)
     t /= np.linalg.norm(t, axis=1, keepdims=True)
@@ -769,6 +778,69 @@ def generate_race_like_track(seed: int):
             g["rugged"] = float(amp)
             return g
     return None
+
+
+# ---------------------------------------------------------------------------
+# Hand-drawn tracks (the team's sketches, digitized: walls, centerline, scale in drawn_tracks.npz)
+# ---------------------------------------------------------------------------
+DRAWN_FILE = pathlib.Path(__file__).resolve().parent / "drawn_tracks.npz"
+DRAWN_BASES = ("Drawn1", "Drawn2", "Drawn3", "Drawn4")  # IMG_0055, then IMG_0056 top / middle / bottom
+# per drawing: the extra scale that brings its narrowest neck to ~0.85-0.95 m (the open parts, which
+# would come out 3-7 m wide, are capped at DRAWN_MAX_WIDTH); variant letter: (scale, mirrored),
+# a-c train, h held-out
+DRAWN_BASE_SCALE = {"Drawn1": 1.6, "Drawn2": 1.13, "Drawn3": 1.8, "Drawn4": 1.35}
+DRAWN_MAX_WIDTH = 2.0  # m, the corridor cap (the open parts of the sketches are much wider)
+DRAWN_VARIANTS = {"a": (1.0, False), "b": (1.1, True), "c": (1.2, False), "h": (1.05, True)}
+
+
+def drawn_track(name: str):
+    """A track from a hand drawing, e.g. "Drawn3b": the drawn lines become 0.30 m ducts (the
+    outer wall's pen-lift gaps were bridged when digitizing), scaled so the corridor's typical
+    width is ~1.45 m and its narrowest 10% >= 0.85 m, times DRAWN_BASE_SCALE (narrowest neck
+    ~0.85-0.95 m) and the variant's scale; mirrored for some variants; corridor capped at
+    DRAWN_MAX_WIDTH. Centerline: the path around the island through the corridor's middle."""
+    from scipy import ndimage as ndi
+
+    base, var = name[:-1], name[-1]
+    k, mirror = DRAWN_VARIANTS[var]
+    with np.load(DRAWN_FILE) as z:
+        shape = tuple(int(v) for v in z[f"{base}_shape"])
+        walls = np.unpackbits(z[f"{base}_walls"])[: shape[0] * shape[1]].reshape(shape).astype(bool)
+        path = z[f"{base}_path"].astype(float)
+        scale = float(z[f"{base}_scale"]) * DRAWN_BASE_SCALE[base] * k
+        ink_half = float(z[f"{base}_ink_half"])
+    if mirror:
+        walls = walls[:, ::-1]
+        path[:, 1] = shape[1] - 1 - path[:, 1]
+    res = GEN_RESOLUTION
+    duct = ndi.distance_transform_edt(~walls) * scale <= max(LAB_WALL / 2 - ink_half * scale, res / 2)
+    H, W = shape
+    pad = LAB_WALL + GEN_MARGIN
+    lo = np.array([-pad, -pad])
+    w_px, h_px = np.ceil((np.array([W * scale, H * scale]) + 2 * pad) / res).astype(int)
+    gx, gy = np.meshgrid(lo[0] + (np.arange(w_px) + 0.5) * res, lo[1] + (np.arange(h_px) + 0.5) * res)
+    col, row = gx / scale, H - gy / scale  # drawing pixels (row 0 at the top of the photo)
+    inside = (row >= 0) & (row < H) & (col >= 0) & (col < W)
+    free = ~(inside & duct[np.clip(row.astype(int), 0, H - 1), np.clip(col.astype(int), 0, W - 1)])
+    xy = np.c_[path[:, 1] * scale, (H - path[:, 0]) * scale]
+    xy = _resample_closed(_smooth_closed(_resample_closed(xy, 0.05), 31), 0.1)  # 1.5 m smoothing: a progress reference
+    # The sketches' corridors vary a lot in width; scaled so the necks are drivable, the open parts
+    # come out 3-7 m wide. Cap them at DRAWN_MAX_WIDTH: keep the corridor within half of it of the
+    # centerline, then wall in what is left with a LAB_WALL band (narrow parts keep the drawn walls).
+    dense = _resample_closed(xy, res / 2)
+    on_line = np.zeros_like(free)
+    ij = np.clip(np.round((dense - lo) / res - 0.5).astype(int), 0, [w_px - 1, h_px - 1])
+    on_line[ij[:, 1], ij[:, 0]] = True
+    labels, _ = ndi.label(free & (ndi.distance_transform_edt(~on_line) * res <= DRAWN_MAX_WIDTH / 2 - res))
+    corridor = labels == labels[ij[0, 1], ij[0, 0]]
+    free = corridor | (ndi.distance_transform_edt(~corridor) * res > LAB_WALL)
+    g = _measure_track(free, lo, res, xy)
+    g["scale"] = scale
+    return g
+
+
+DRAWN_TRAIN_MAPS = tuple(f"{b}{v}" for b in DRAWN_BASES for v in "abc")
+DRAWN_HELDOUT_MAPS = ("Drawn1h", "Drawn3h")
 
 
 def race_like_name(seed: int) -> str:
@@ -948,10 +1020,10 @@ RACE_LIKE_UNSEEN_MAPS = tuple(race_like_name(s) for s in RACE_LIKE_UNSEEN_SEEDS)
 TRAP_TRAIN_MAPS = tuple(trap_name(s) for s in TRAP_TRAIN_SEEDS)
 TRAP_HELDOUT_MAPS = tuple(trap_name(s) for s in TRAP_HELDOUT_SEEDS)
 TRAP_UNSEEN_MAPS = tuple(trap_name(s) for s in TRAP_UNSEEN_SEEDS)
-# Lab fine-tune (32 maps, 64 envs each): the last race's track both ways, tracks like it, and
-# speed-trap loops. Selection: held-out race-like and trap tracks.
-LAB_FT_TRAIN_MAPS = LAST_RACE_MAPS + RACE_LIKE_TRAIN_MAPS + TRAP_TRAIN_MAPS
-LAB_FT_HELDOUT_MAPS = RACE_LIKE_HELDOUT_MAPS + TRAP_HELDOUT_MAPS
+# Lab fine-tune (32 maps, 64 envs each): the last race's track both ways, 12 tracks like it, the 4 hand
+# drawings in 3 variants each, and 6 speed-trap loops. Selection: held-out race-like, drawn and trap tracks.
+LAB_FT_TRAIN_MAPS = LAST_RACE_MAPS + RACE_LIKE_TRAIN_MAPS[:12] + DRAWN_TRAIN_MAPS + TRAP_TRAIN_MAPS[:6]
+LAB_FT_HELDOUT_MAPS = RACE_LIKE_HELDOUT_MAPS[:3] + DRAWN_HELDOUT_MAPS + TRAP_HELDOUT_MAPS
 LAB_EVAL_UNSEEN_MAPS = RACE_LIKE_UNSEEN_MAPS + TRAP_UNSEEN_MAPS
 assert not set(LAB_FT_TRAIN_MAPS) & set(LAB_FT_HELDOUT_MAPS + LAB_EVAL_UNSEEN_MAPS)
 assert not set(LAB_FT_HELDOUT_MAPS) & set(LAB_EVAL_UNSEEN_MAPS)
@@ -985,6 +1057,7 @@ def prepare_maps(map_dir: os.PathLike = DEFAULT_MAP_DIR, maps=TRAIN_MAPS + HELDO
     seeds.update({race_like_name(s): (generate_race_like_track, s)
                   for s in RACE_LIKE_TRAIN_SEEDS + RACE_LIKE_HELDOUT_SEEDS + RACE_LIKE_UNSEEN_SEEDS})
     seeds.update({trap_name(s): (generate_trap_track, s) for s in TRAP_TRAIN_SEEDS + TRAP_HELDOUT_SEEDS + TRAP_UNSEEN_SEEDS})
+    seeds.update({n: (drawn_track, n) for n in DRAWN_TRAIN_MAPS + DRAWN_HELDOUT_MAPS})
     for name in maps:
         if name in seeds:
             gen, seed = seeds[name]

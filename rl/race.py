@@ -5,11 +5,13 @@ phase 1's whole pipeline (delay, steering offset, LiDAR noise, wall buffer,
 wrong-way and stall ends, progress + smoothness reward). Agent 1 is the
 opponent, drawn per episode:
 
-    solo        (25%) parked far off the map: the phase-1c setup
-    snapshot    (40%) a past ego GRU, run in JAX with its own hidden state
+    solo        (20%) parked far off the map: the phase-1c setup
+    snapshot    (35%) a past ego GRU, run in JAX with its own hidden state
                       (pool passed to step(); falls back to pure pursuit when absent)
-    follow-gap  (20%) JAX port of the team's follow-the-gap, speed x U(0.6, 1.0)
-    pursuit     (15%) centerline pure pursuit, speed x U(0.6, 1.0)
+    follow-gap  (15%) JAX port of the team's follow-the-gap, speed x U(0.6, 1.0)
+    pursuit     (30%) pure pursuit on the track's racing line (racing_line()): half
+                      at its curvature-limited speed x U(0.6, 1.0), half slow cars
+                      at a constant U(0.7, 1.3) m/s, to be caught and passed
 
 Starts: side by side (same s, each car a quarter of the local track width
 off the centerline; the width is measured from the map, since track files
@@ -47,8 +49,12 @@ from .wrappers import Phase1Wrapper, WrapperState, add_steer_offset, delay_actio
 
 OPP_SOLO, OPP_SNAPSHOT, OPP_FTG, OPP_PURSUIT = 0, 1, 2, 3
 OPP_NAMES = ("solo", "snapshot", "follow_gap", "pursuit")
-OPP_MIX = (0.25, 0.40, 0.20, 0.15)
+OPP_MIX = (0.20, 0.35, 0.15, 0.30)
 SPEED_SCALE = (0.6, 1.0)
+SLOW_SHARE = 0.5  # of pursuit opponents: slow cars on the racing line
+SLOW_SPEED = (0.7, 1.3)  # m/s
+NO_CAP = 100.0  # m/s: no speed cap
+LINE_CLEARANCE = cp.WIDTH / 2 + 0.2  # m: the racing line keeps half the car plus 20 cm from the walls
 STAGGER_M = (1.0, 5.0)
 SIDE_BY_SIDE_MIN_HALF = 0.6  # m: side-by-side starts only where the corridor is >= 1.2 m wide (else staggered)
 PARK_XY = (1.0e4, 1.0e4)  # far beyond max range of any scan, off every map
@@ -59,16 +65,51 @@ PRIV_DIM = 17  # opponent (ds, dey, dpsi, v), ego (vx, vy, yaw rate, ey), mu, m,
 
 
 # ---------------------------------------------------------------- opponents
-def pure_pursuit(env: F110Env, car: chex.Array, s: chex.Array, speed_scale, lookahead=1.5, v_max=6.0, a_lat=4.0):
-    """Centerline follower: [steer, speed]; speed limited by the curvature ahead."""
-    target = env.track.vmap_frenet_to_cartesian_jax(jnp.array([[s + lookahead, 0.0, 0.0]]))[0]
+def racing_line(map_name: str, track_length: float, clearance: float = LINE_CLEARANCE):
+    """A short, low-curvature line inside the corridor, as lateral offsets from the
+    centerline: an elastic band (each point repeatedly moves along the track normal
+    toward the midpoint of its neighbours 2 m, then 1 m, then 0.5 m away), kept
+    ``clearance`` inside the narrower side. Returns (s, ey) at the centerline file's
+    points, s scaled to ``track_length``."""
+    from f1tenth_gym_jax.envs.track.utils import find_track_dir
+
+    d = find_track_dir(map_name)
+    cl = np.loadtxt(pathlib.Path(d) / f"{d.name}_centerline.csv", delimiter=",", comments="#", ndmin=2)
+    xy = cl[:, :2]
+    bound = np.maximum(np.minimum(cl[:, 2], cl[:, 3]) - clearance, 0.0)
+    t = np.roll(xy, -1, axis=0) - np.roll(xy, 1, axis=0)
+    t /= np.linalg.norm(t, axis=1, keepdims=True)
+    normal = np.c_[-t[:, 1], t[:, 0]]
+    seg = np.hypot(*np.diff(np.vstack([xy, xy[:1]]), axis=0).T)
+    spacing = float(np.median(seg))
+    ey = np.zeros(len(xy))
+    for dist in (2.0, 1.0, 0.5):
+        k = max(1, int(round(dist / spacing)))
+        for _ in range(400):
+            pts = xy + normal * ey[:, None]
+            mid = (np.roll(pts, k, axis=0) + np.roll(pts, -k, axis=0)) / 2
+            ey = np.clip(ey + 0.5 * np.einsum("ij,ij->i", mid - pts, normal), -bound, bound)
+    s = np.concatenate([[0.0], np.cumsum(seg)[:-1]]) * (track_length / seg.sum())
+    return s.astype(np.float32), ey.astype(np.float32)
+
+
+def pure_pursuit(env: F110Env, car: chex.Array, s: chex.Array, speed_scale, v_max=6.0, a_lat=4.0,
+                 line=None, v_cap=NO_CAP):
+    """Line follower: [steer, speed]. Follows ``line`` = (s, ey) arrays (racing_line())
+    or the centerline; the lookahead grows with speed (0.6-1.5 m); speed limited by the
+    curvature ahead, times ``speed_scale``, at most ``v_cap``."""
+    lookahead = jnp.clip(0.5 + 0.35 * car[3], 0.6, 1.5)
+    s_t = s + lookahead
+    ey = 0.0 if line is None else jnp.interp(jnp.mod(s_t, env.track_length), line[0], line[1],
+                                             period=env.track_length)
+    target = env.track.vmap_frenet_to_cartesian_jax(jnp.stack([s_t, ey, 0.0])[None])[0]
     x, y, psi = car[0], car[1], car[4]
     alpha = jnp.arctan2(target[1] - y, target[0] - x) - psi
     steer = jnp.clip(jnp.arctan2(2.0 * cp.WHEELBASE * jnp.sin(alpha), lookahead), -cp.S_MAX, cp.S_MAX)
     ks = jax.vmap(env.track.centerline.calc_curvature_jax)(s + jnp.array([0.0, 1.0, 2.0, 3.0]))
     kappa = jnp.max(jnp.abs(ks))
     speed = speed_scale * jnp.minimum(v_max, jnp.sqrt(a_lat / jnp.maximum(kappa, 1e-3)))
-    return jnp.array([steer, speed])
+    return jnp.array([steer, jnp.minimum(speed, v_cap)])
 
 
 def follow_the_gap(ranges: chex.Array, speed_scale, fov_deg=180.0, bubble_deg=15.0, best_window_deg=50.0,
@@ -119,6 +160,7 @@ class RaceState:
     ego: WrapperState  # phase-1 bookkeeping; ego.env_state holds both cars
     opp_type: chex.Array  # int32, OPP_*
     opp_speed_scale: chex.Array
+    opp_v_cap: chex.Array  # m/s; slow pursuit cars: U(SLOW_SPEED), else NO_CAP
     opp_snapshot: chex.Array  # int32 index into the snapshot pool
     opp_h: chex.Array  # [gru_dim] snapshot opponent's GRU state
     opp_first: chex.Array  # bool, the snapshot's next step starts its episode
@@ -151,6 +193,8 @@ class RaceWrapper(Phase1Wrapper):
         self.fixed_speed_scale = fixed_speed_scale
         self.fixed_side_by_side = fixed_side_by_side
         self.obs_dim = ob.obs_dim(1, self.num_beams) + PRIV_DIM
+        s_line, ey_line = racing_line(env.params.map_name, float(self.track_length))
+        self.line = (jnp.asarray(s_line), jnp.asarray(ey_line))
 
     # ------------------------------------------------------------ helpers
     def _build_obs(self, stack, speed, prev_action, priv):
@@ -183,7 +227,9 @@ class RaceWrapper(Phase1Wrapper):
     def _opp_action(self, key, rs: RaceState, opp_params):
         es = rs.ego.env_state
         car, s = es.cartesian_states[1], es.frenet_states[1, 0]
-        pursuit = pure_pursuit(self._env, car, s, rs.opp_speed_scale)
+        slow = rs.opp_v_cap < NO_CAP
+        pursuit = pure_pursuit(self._env, car, s, jnp.where(slow, 1.0, rs.opp_speed_scale), line=self.line,
+                               v_cap=rs.opp_v_cap)
         ftg = follow_the_gap(es.scans[1], rs.opp_speed_scale)
         parked = jnp.zeros(2)
         h, prev = rs.opp_h, rs.opp_prev_action
@@ -249,6 +295,7 @@ class RaceWrapper(Phase1Wrapper):
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey):
         k_base, k_opp, k_place, k_scan, k_noise, k_scale, k_snap = jax.random.split(key, 7)
+        k_slow, k_vcap = jax.random.split(jax.random.fold_in(key, 11))  # own stream: the other draws keep theirs
         _, base = super().reset(k_base)  # ego draws and bookkeeping; both cars' vehicle params
         p = jnp.array(OPP_MIX if self.opponents else (1.0, 0.0, 0.0, 0.0))
         opp_type = jax.random.choice(k_opp, 4, p=p).astype(jnp.int32)
@@ -263,6 +310,9 @@ class RaceWrapper(Phase1Wrapper):
             opp_type=opp_type,
             opp_speed_scale=(jax.random.uniform(k_scale, minval=SPEED_SCALE[0], maxval=SPEED_SCALE[1])
                              if self.fixed_speed_scale is None else jnp.array(self.fixed_speed_scale, jnp.float32)),
+            opp_v_cap=jnp.where((opp_type == OPP_PURSUIT) & jax.random.bernoulli(k_slow, SLOW_SHARE),
+                                jax.random.uniform(k_vcap, minval=SLOW_SPEED[0], maxval=SLOW_SPEED[1]),
+                                NO_CAP).astype(jnp.float32),
             opp_snapshot=jax.random.randint(k_snap, (), 0, 1 << 20).astype(jnp.int32),
             opp_h=jnp.zeros((self.gru_dim,)),
             opp_first=jnp.array(True),

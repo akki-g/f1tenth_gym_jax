@@ -235,3 +235,64 @@ def test_race_evaluator_runs_every_setting(race_trainer):
     starts = {(c["opponent"], c["start"]) for c in rep["cases"]}
     assert ("follow_gap_0.9", "side_by_side") in starts and ("follow_gap_0.9", "staggered") in starts
     assert all(0.0 <= c["win_rate"] <= 1.0 for c in rep["cases"])
+
+
+# ---------------------------------------------------------------------------
+# Racing line and slow pursuit opponents (lab tracks)
+# ---------------------------------------------------------------------------
+def _line_lap(name, speed_scale, v_cap, steps=4000):
+    """Drive agent 0 with the race pursuit opponent on the map's racing line; returns
+    (collided, laps, mean speed)."""
+    from f1tenth_gym_jax.envs import F110Env
+    from rl import maps as M
+    from rl import race as RC
+    from rl.domain_rand import make_param
+
+    M.use_map_dir(M.DEFAULT_MAP_DIR)
+    M.prepare_maps(M.DEFAULT_MAP_DIR, (name,)) if name.startswith("Lab") else None
+    env = F110Env(1, make_param(name, randomize=False, produce_scans=False, max_steps=steps + 10))
+    line = tuple(jnp.asarray(a) for a in RC.racing_line(name, float(env.track_length)))
+    _, st = env.reset(jax.random.PRNGKey(0))
+
+    @jax.jit
+    def step(st):
+        cmd = RC.pure_pursuit(env, st.cartesian_states[0], st.frenet_states[0, 0], speed_scale, line=line, v_cap=v_cap)
+        _, st, rew, dones, _ = env.step_env(jax.random.PRNGKey(0), st, {"agent_0": cmd})
+        return st, rew["agent_0"], dones["__all__"]
+
+    progress, speeds = 0.0, []
+    for t in range(steps):
+        st, r, done = step(st)
+        progress += float(r) / float(env.track_length)
+        speeds.append(float(st.cartesian_states[0, 3]))
+        if bool(done) or progress >= 1.0:
+            break
+    return bool(st.collisions[0]), progress, float(np.mean(speeds[25:]))
+
+
+def test_racing_line_inside_corridor_and_shorter():
+    from rl import maps as M
+    from rl import race as RC
+
+    M.use_map_dir(M.DEFAULT_MAP_DIR)
+    M.prepare_maps(M.DEFAULT_MAP_DIR, M.LAB_TRAIN_MAPS[:3])
+    for name in M.LAB_TRAIN_MAPS[:3] + ("Duct1002",):
+        d = M.DEFAULT_MAP_DIR / name
+        cl = np.loadtxt(d / f"{name}_centerline.csv", delimiter=",", comments="#")
+        s, ey = RC.racing_line(name, 10.0)
+        bound = np.minimum(cl[:, 2], cl[:, 3]) - RC.LINE_CLEARANCE
+        assert np.all(np.abs(ey) <= np.maximum(bound, 0.0) + 1e-5), name
+        t = np.roll(cl[:, :2], -1, 0) - np.roll(cl[:, :2], 1, 0)
+        t /= np.linalg.norm(t, axis=1, keepdims=True)
+        line = cl[:, :2] + np.c_[-t[:, 1], t[:, 0]] * ey[:, None]
+        length = lambda p: np.sum(np.hypot(*np.diff(np.vstack([p, p[:1]]), axis=0).T))  # noqa: E731
+        assert length(line) < length(cl[:, :2]), name
+        assert np.abs(ey).max() > 0.05, name  # it does leave the centerline
+
+
+@pytest.mark.parametrize("name", ["Lab2004", "Lab2021", "Lab2506", "Duct1002"])
+def test_slow_and_normal_pursuit_lap_on_racing_line(name):
+    collided, laps, v = _line_lap(name, 1.0, 1.0)  # slow car: 1 m/s cap
+    assert not collided and laps >= 1.0 and 0.8 <= v <= 1.05, (name, collided, laps, v)
+    collided, laps, v = _line_lap(name, 1.0, 100.0)  # curvature-limited speed
+    assert not collided and laps >= 1.0 and v > 1.2, (name, collided, laps, v)
